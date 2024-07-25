@@ -980,6 +980,469 @@ class ThermalTopologyAnalysis:
         return fig, ax
 
 
+class ThermalOpt:
+    def __init__(self, topo, heat_func, compliance_func=None, nsteps=100, tfinal=1.0):
+        """
+        Initialize the thermal problem
+        """
+
+        self.heat_func = heat_func
+        self.compliance_func = compliance_func
+        self.cases = []
+        for case_name in self.heat_func:
+            self.cases.append(case_name)
+
+        self.topo = topo
+
+        self.tfinal = tfinal
+        self.nsteps = nsteps
+        self.t = np.linspace(0, self.tfinal, nsteps + 1)
+        self.dt = self.tfinal / nsteps
+
+        # Compute the weights for evaluating the time integral
+        self.h = np.zeros(self.nsteps)
+        self.h[:-1] += 0.5 * self.dt
+        self.h[1:] += 0.5 * self.dt
+
+        self.fobj_scale = 10.0
+        self.con_scale = 1.0
+
+        # Set up the compliance function vector
+        if self.compliance_func is not None:
+            self.vec = np.ones(self.topo.nnodes)
+            for key in self.compliance_func:
+                if key in self.topo.mean_vecs:
+                    self.vec += self.compliance_func[key] * self.topo.mean_vecs[key]
+
+        return
+
+    def initialize(self, store=False):
+        self.topo.initialize(store)
+
+        self.lam = self.topo.lam
+        self.coef = self.topo.get_mean_coefficients()
+
+        self.xi = {}
+        for case_name in self.cases:
+            self.xi[case_name] = self._solve_forward(case_name)
+
+        return
+
+    def initialize_adjoint(self):
+        self.topo.initialize_adjoint()
+        self.lamb = np.zeros(self.lam.shape)
+        self.coefb = {}
+        for name in self.coef:
+            self.coefb[name] = np.zeros(self.coef[name].shape)
+
+        self.xib = {}
+        for case_name in self.cases:
+            self.xib[case_name] = np.zeros(self.xi[case_name].shape)
+
+        return
+
+    def finalize_adjoint(self):
+        for case_name in self.cases:
+            self._solve_adjoint(case_name, self.xi[case_name], self.xib[case_name])
+
+        self.topo.lamb += self.lamb
+        self.topo.add_mean_derivatives(self.coefb)
+
+        self.topo.finalize_adjoint()
+
+        return
+
+    def get_thermal_compliance(self):
+        return self.topo.get_thermal_compliance(self.vec)
+
+    def add_thermal_compliance_derivative(self, scale=1.0):
+        self.topo.add_thermal_compliance_derivative(scale, self.vec)
+        return
+
+    def eval_ks_functions(self, rho):
+        ks = {}
+        for case_name in self.cases:
+            ks[case_name] = self._eval_ks_function(rho, self.xi[case_name])
+
+        return ks
+
+    def add_ks_derivative(self, rho, ksb):
+        for case_name in self.cases:
+            self._add_ks_derivative(
+                rho, self.xi[case_name], ksb[case_name], self.xib[case_name]
+            )
+
+        return
+
+    def _eval_ks_function(self, rho, xi):
+        Tmax = 0.0
+        for k in range(1, self.nsteps):
+            for name in self.coef:
+                T = self.coef[name].dot(xi[:, k])
+                if T.real > Tmax.real:
+                    Tmax = T
+
+        ks_sum = 0.0
+        for k in range(1, self.nsteps):
+            for name in self.coef:
+                T = self.coef[name].dot(xi[:, k])
+                ks_sum += np.exp(rho * (T - Tmax))
+
+        return Tmax + np.log(ks_sum) / rho
+
+    def _add_ks_derivative(self, rho, xi, ksb, xib):
+        Tmax = 0.0
+        for k in range(1, self.nsteps):
+            for name in self.coef:
+                T = self.coef[name].dot(xi[:, k])
+                if T.real > Tmax.real:
+                    Tmax = T
+
+        ks_sum = 0.0
+        for k in range(1, self.nsteps):
+            for name in self.coef:
+                T = self.coef[name].dot(xi[:, k])
+                ks_sum += np.exp(rho * (T - Tmax))
+
+        for k in range(1, self.nsteps):
+            for name in self.coef:
+                T = self.coef[name].dot(xi[:, k])
+                eta = ksb * np.exp(rho * (T - Tmax)) / ks_sum
+
+                # Add the derivative contributions
+                self.coefb[name] += eta * xi[:, k]
+                xib[:, k] += eta * self.coef[name]
+
+        return
+
+    def test_ks_func(
+        self, rho=10.0, dh_cs=1e-20, dh_fd=1e-6, dh_cd=1e-4, ksb=None, pert=None
+    ):
+        # Initialize the problem
+        self.initialize(store=True)
+        ks = self.eval_ks_functions(rho)
+
+        # Copy the design variables
+        x0 = np.array(self.topo.x)
+
+        # Create the derivative wrt each ks function
+        if ksb is None:
+            ksb = {}
+            for name in ks:
+                ksb[name] = np.random.uniform()
+
+        # Create the derivatives
+        self.initialize_adjoint()
+        self.add_ks_derivative(rho, ksb)
+        self.finalize_adjoint()
+
+        # Set a random perturbation to the design variables
+        if pert is None:
+            pert = np.random.uniform(size=x0.shape)
+
+        # The exact derivative
+        data = {}
+        data["ans"] = np.dot(pert, self.topo.xb)
+        data.update(self.topo.profile)
+
+        if self.topo.solver_type == "BasicLanczos":
+            # Perturb the design variables for complex-step
+            self.topo.x = np.array(x0).astype(complex)
+            self.topo.x.imag += dh_cs * pert
+            self.initialize()
+
+            ks1 = self.eval_ks_functions(rho)
+
+            data["dh_cs"] = dh_cs
+            data["cs"] = 0.0
+            for name in ks1:
+                data["cs"] += np.sum(ksb[name] * ks1[name].imag / dh_cs)
+            data["cs_err"] = np.fabs((data["ans"] - data["cs"]) / data["cs"])
+
+        # Perturb the design variables for finite-difference
+        self.topo.x = x0 + dh_fd * pert
+        self.initialize()
+        ks2 = self.eval_ks_functions(rho)
+
+        # Compute the finite-difference and relative error
+        data["dh_fd"] = dh_fd
+        data["fd"] = 0.0
+        for name in ks2:
+            data["fd"] += np.sum(ksb[name] * (ks2[name] - ks[name]) / dh_fd)
+        data["fd_err"] = np.fabs((data["ans"] - data["fd"]) / data["fd"])
+
+        self.topo.x = x0 - dh_cd * pert
+        self.initialize()
+        ks3 = self.eval_ks_functions(rho)
+
+        self.topo.x = x0 + dh_cd * pert
+        self.initialize()
+        ks4 = self.eval_ks_functions(rho)
+
+        # Compute the finite-difference and relative error
+        data["dh_cd"] = dh_cd
+        data["cd"] = 0.0
+        for name in ks3:
+            data["cd"] += np.sum(ksb[name] * (ks4[name] - ks3[name]) / (2 * dh_cd))
+        data["cd_err"] = np.fabs((data["ans"] - data["cd"]) / data["cd"])
+
+        # Reset the design variables
+        self.topo.x = x0
+
+        if self.topo.solver_type == "BasicLanczos":
+            print(
+                "%25s  %25s  %25s  %25s  %25s"
+                % ("Answer", "CS", "FD", "CS Rel Error", "FD Rel Error")
+            )
+            print(
+                "%25.15e  %25.15e  %25.15e  %25.15e  %25.15e"
+                % (data["ans"], data["cs"], data["fd"], data["cs_err"], data["fd_err"])
+            )
+        else:
+            print("%25s  %25s  %25s" % ("Answer", "FD", "FD Rel Error"))
+            print(
+                "%25.15e  %25.15e  %25.15e" % (data["ans"], data["fd"], data["fd_err"])
+            )
+
+        return data
+
+    def _compute_residual(self, case_name, xidot, xi, t):
+        """
+        Compute the residual of the modal heat equations
+
+        res = xidot + lam[i] * xi - heat
+        """
+
+        res = xidot + self.lam * xi
+        for name in self.heat_func[case_name]:
+            if name in self.coef:
+                res -= self.coef[name] * self.heat_func[case_name][name](t)
+
+        return res
+
+    def _add_adjoint_derivative(self, case_name, xi, t, adjoint):
+        """
+        Add contributions to the derivatives
+        """
+        self.lamb += adjoint * xi
+        for name in self.heat_func[case_name]:
+            if name in self.coef:
+                self.coefb[name] -= adjoint * self.heat_func[case_name][name](t)
+
+        return
+
+    def _solve_forward(self, case):
+        """
+        Find the solution of the time-dependent modal heat equations.
+        """
+
+        # Allocate space for the state variables
+        N = len(self.lam)
+        xi = np.zeros((N, self.nsteps + 1), dtype=self.lam.dtype)
+
+        # The diagonal Jacobian matrix
+        beta = 1.0 / self.dt
+        J = beta + 0.5 * self.lam
+
+        # Integrate forward in time
+        for k in range(1, self.nsteps + 1):
+            # Initial guess
+            xi[:, k] = xi[:, k - 1]
+
+            # Compute the time value
+            tk = 0.5 * (self.t[k] + self.t[k - 1])
+
+            # Compute the state values and derivative approx at the mid-point
+            xik = 0.5 * (xi[:, k] + xi[:, k - 1])
+            xikdot = beta * (xi[:, k] - xi[:, k - 1])
+
+            res = self._compute_residual(case, xikdot, xik, tk)
+
+            # Solve the governing equations - they are linear and diagonal
+            xi[:, k] -= res / J
+
+        return xi
+
+    def _solve_adjoint(self, case, xi, xib):
+        """
+        Add up the contributions to the derivatives
+        """
+
+        N = len(self.lam)
+        res = np.zeros(N, dtype=self.lam.dtype)
+
+        # The diagonal Jacobian matrix
+        beta = 1.0 / self.dt
+        J = 0.5 * self.lam + beta
+
+        # Integrate the adjoint in reverse
+        for k in range(self.nsteps, 0, -1):
+            res[:] -= xib[:, k]
+
+            # Compute the time value
+            tk = 0.5 * (self.t[k] + self.t[k - 1])
+            xik = 0.5 * (xi[:, k] + xi[:, k - 1])
+
+            # Compute the adjoint variables
+            adjoint = res / J
+
+            # Add the derivative contributions from the adjoint
+            self._add_adjoint_derivative(case, xik, tk, adjoint)
+
+            # Compute the initial right-hand-side for the next step
+            res[:] = -(0.5 * self.lam - beta) * adjoint
+
+        return
+
+    def plot_modal_amplitudes(self, case_name, ax=None):
+        xi = self.xi[case_name]
+        if ax is None:
+            fig, ax = plt.subplots()
+        N = len(self.lam)
+        for i in range(N):
+            ax.plot(self.t, xi[i, :].real, label="mode %d" % (i))
+        ax.legend()
+
+        return
+
+    def plot_average_temperatures(self, case_name, path=None):
+        fig, ax = plt.subplots()
+        xi = self.xi[case_name]
+        for name in self.coef:
+            ax.plot(self.t, xi.T @ self.coef[name], label=name)
+        ax.legend()
+        ax.set_xlabel("Time")
+        ax.set_ylabel("Average Temperature")
+        if path is not None:
+            fig.savefig(path)
+
+        return
+
+    def plot_temperature_history(
+        self, case_name, hist="modal", skip=1, path=lambda i: f"file{i}.png"
+    ):
+        # Figure out the range of values
+        min_val = 0.0
+        max_val = 0.0
+        for name in self.coef:
+            temps = self.xi[case_name].T @ self.coef[name]
+            min_val = np.min((min_val, np.min(temps)))
+            max_val = np.max((max_val, np.max(temps)))
+
+        delta = max_val - min_val
+        max_val += 0.25 * delta
+        min_val -= 0.25 * delta
+        levels = np.linspace(min_val, max_val, 25)
+
+        if hist == "modal":
+            for k in range(skip, self.nsteps + 1, skip):
+                u = self.topo.Q @ self.xi[case_name][:, k]
+
+                fig, ax = plt.subplots(figsize=(5, 5))
+                self.topo.plot(u, ax=ax, levels=levels, extend="both")
+                ax.set_aspect("equal")
+                ax.axis("off")
+                fig.savefig(path(k), bbox_inches="tight")
+                plt.close()
+        elif hist == "full":
+            M = self.topo.M
+            K = self.topo.K
+            mean_vecs = self.topo.mean_vecs
+            u = self.full_model_integration(case_name, M, K, mean_vecs)
+
+            for k in range(skip, self.nsteps + 1, skip):
+                fig, ax = plt.subplots(figsize=(5, 5))
+                self.topo.plot(u[:, k], ax=ax, levels=levels, extend="both")
+                ax.set_aspect("equal")
+                ax.axis("off")
+                fig.savefig(path(k), bbox_inches="tight")
+                plt.close()
+
+        return
+
+    def full_model_integration(self, case, M, K, mean_vecs):
+        beta = 1.0 / self.dt
+        J = beta * M + 0.5 * K
+        J = J.tocsc()
+
+        factor = SpLuOperator(J)
+
+        # Create the solution field
+        u = np.zeros((self.topo.nnodes, self.nsteps + 1))
+
+        for k in range(1, self.nsteps + 1):
+            u[:, k] = u[:, k - 1]
+
+            # Compute the time value
+            tk = 0.5 * (self.t[k] + self.t[k - 1])
+
+            # Compute the state values and derivative approx at the mid-point
+            uk = 0.5 * (u[:, k] + u[:, k - 1])
+            ukdot = beta * (u[:, k] - u[:, k - 1])
+
+            res = M @ ukdot + K @ uk
+            for name in self.heat_func[case]:
+                if name in mean_vecs:
+                    res -= mean_vecs[name] * self.heat_func[case][name](tk)
+
+            # Solve the governing equations
+            u[:, k] -= factor(res)
+
+        return u
+
+    def get_full_model_average_temperatures(self, case):
+        M = self.topo.M
+        K = self.topo.K
+        mean_vecs = self.topo.mean_vecs
+
+        u = self.full_model_integration(case, M, K, mean_vecs)
+
+        average_temps = {}
+        for name in mean_vecs:
+            average_temps[name] = u.T @ mean_vecs[name]
+
+        return average_temps
+
+    def plot_compare_temperatures(self, case_name, path=None):
+        fig, ax = plt.subplots(3, 1, figsize=(8, 8), sharex=True)
+
+        average_temps = {}
+        for name in self.coef:
+            average_temps[name] = self.xi[case_name].T @ self.coef[name]
+
+        for name in average_temps:
+            ax[0].plot(self.t, average_temps[name], label=name)
+
+        # ax[0].legend()
+        ax[0].set_xlabel("Time")
+        ax[0].set_ylabel("Average Temperature")
+
+        full_average_temps = self.get_full_model_average_temperatures(case_name)
+        for name in average_temps:
+            ax[1].plot(self.t, full_average_temps[name], label=name)
+
+        # ax[1].legend()
+        ax[1].set_xlabel("Time")
+        ax[1].set_ylabel("Average Temperature")
+
+        for name in average_temps:
+            norm = np.max(np.absolute(full_average_temps[name]))
+            ax[2].semilogy(
+                self.t,
+                np.absolute(average_temps[name] - full_average_temps[name]) / norm,
+                label=name,
+            )
+
+        # ax[2].legend()
+        ax[2].set_xlabel("Time")
+        ax[2].set_ylabel("Relative difference")
+
+        if path is not None:
+            fig.savefig(path)
+
+        return
+
+
 def make_model(nx=128, ny=128, Lx=1.0, Ly=1.0, rfact=4.0, **kwargs):
     x = np.linspace(0, Lx, nx + 1)
     y = np.linspace(0, Ly, ny + 1)
@@ -1133,6 +1596,10 @@ if __name__ == "__main__":
 
     element_sets = {"center": []}
 
+    test = "repeated"
+    if "transient" in sys.argv:
+        test = "transient"
+
     if "dl" in sys.argv:
         method = "dl"
         adjoint_options = {"lanczos_guess": False}
@@ -1161,7 +1628,55 @@ if __name__ == "__main__":
     print("adjoint_options = ", adjoint_options)
     print("solver_type = ", solver_type)
 
-    for epsilon in [0.1, 1e-6, 1e-8]:
+    if test == "repeated":
+        for epsilon in [0.1, 1e-6, 1e-8]:
+            # Create the topology optimization problem
+            topo = make_opt_model(
+                nx=128,
+                rfact=4.0,
+                N=20,
+                m=90,
+                p=3,
+                epsilon=epsilon,
+                solver_type=solver_type,
+                adjoint_method=method,
+                adjoint_options=adjoint_options,
+                element_sets=element_sets,
+                eig_atol=1e-5,
+                rtol=1e-12,
+                deriv_type="tensor",
+            )
+
+            # Test the compliance derivatives
+            data = topo.test_compliance_derivatives(dh_cs=1e-20)
+    elif test == "transient":
+        tfinal = 25.0
+
+        cases = ["test"]
+        heat_funcs = {}
+        heat_funcs["test"] = {}
+
+        beta = 50 / tfinal
+        H = lambda t: 0.5 + 0.5 * np.tanh(beta * t)
+        interval = lambda t, t0, t1: (H(t - t0) + H(t1 - t) - 1.0)
+        interval0 = lambda t, t0, t1: interval(t, t0, t1) - interval(0, t0, t1)
+
+        heat_funcs["test"]["center"] = lambda t: 10 * interval0(
+            t, 0.1 * tfinal, 1.5 * tfinal
+        )
+        heat_funcs["test"]["corner0"] = lambda t: -2.5 * interval0(
+            t, 0.1 * tfinal, 1.5 * tfinal
+        )
+        heat_funcs["test"]["corner1"] = lambda t: -2.5 * interval0(
+            t, 0.1 * tfinal, 1.5 * tfinal
+        )
+        heat_funcs["test"]["corner2"] = lambda t: -2.5 * interval0(
+            t, 0.1 * tfinal, 1.5 * tfinal
+        )
+        heat_funcs["test"]["corner3"] = lambda t: -2.5 * interval0(
+            t, 0.1 * tfinal, 1.5 * tfinal
+        )
+
         # Create the topology optimization problem
         topo = make_opt_model(
             nx=128,
@@ -1169,7 +1684,7 @@ if __name__ == "__main__":
             N=20,
             m=90,
             p=3,
-            epsilon=epsilon,
+            epsilon=1e-5,
             solver_type=solver_type,
             adjoint_method=method,
             adjoint_options=adjoint_options,
@@ -1179,5 +1694,6 @@ if __name__ == "__main__":
             deriv_type="tensor",
         )
 
-        # Test the compliance derivatives
-        data = topo.test_compliance_derivatives(dh_cs=1e-20)
+        opt = ThermalOpt(topo, heat_funcs, nsteps=400, tfinal=tfinal)
+
+        data = opt.test_ks_func()
