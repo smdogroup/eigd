@@ -1,18 +1,14 @@
 import time
 
-from eigd import (
-    IRAM,
-    BasicLanczos,
-    SpLuOperator,
-    eval_adjoint_residual_norm,
-)
-from fe_utils import compute_detJ, populate_thermal_Be, populate_thermal_He
+from fe_utils import compute_detJ, populate_thermal_Be_and_He
 import matplotlib.pylab as plt
 import matplotlib.tri as tri
 from node_filter import NodeFilter
 import numpy as np
 from scipy import sparse
 from scipy.linalg import eigh
+
+from eigd import IRAM, BasicLanczos, SpLuOperator, eval_adjoint_residual_norm
 
 
 class ThermalTopologyAnalysis:
@@ -29,13 +25,13 @@ class ThermalTopologyAnalysis:
         heat_capacity=1.0,
         rho0=1e-6,
         p=3,
-        beta=0.1,
+        beta=1e-6,
         sigma=-0.1,
         N=10,
         m=None,
         Ntarget=None,
         solver_type="IRAM",
-        tol=1e-14,
+        tol=0.0,
         rtol=1e-10,
         eig_atol=1e-5,
         adjoint_method="shift-invert",
@@ -101,6 +97,32 @@ class ThermalTopologyAnalysis:
 
         return
 
+    def intital_thermal_Be_and_He(self):
+        # Compute the element stiffness matrix
+        gauss_pts = [-1.0 / np.sqrt(3.0), 1.0 / np.sqrt(3.0)]
+
+        # Compute the x and y coordinates of each element
+        xe = self.X[self.conn, 0]
+        ye = self.X[self.conn, 1]
+
+        Be = np.zeros((self.nelems, 2, 4, 4))
+        He = np.zeros((self.nelems, 4, 4))
+        detJ = np.zeros((self.nelems, 4))
+
+        for j in range(2):
+            for i in range(2):
+                xi = gauss_pts[i]
+                eta = gauss_pts[j]
+
+                index = 2 * j + i
+                Bei = Be[:, :, :, index]
+                Hei = He[:, :, index]
+                detJ[:, index] = populate_thermal_Be_and_He(
+                    self.nelems, xi, eta, xe, ye, Bei, Hei
+                )
+
+        return detJ, Be, He
+
     def get_stiffness_matrix(self, rhoE):
         """
         Assemble the stiffness matrix
@@ -109,22 +131,13 @@ class ThermalTopologyAnalysis:
         # Compute the element stiffnesses
         kappa = self.kappa * ((1 - self.beta) * rhoE**self.p + self.beta)
 
-        # Compute the element stiffness matrix
-        gauss_pts = [-1.0 / np.sqrt(3.0), 1.0 / np.sqrt(3.0)]
-
         # Assemble all of the the 4 x 4 element stiffness matrix
         Ke = np.zeros((self.nelems, 4, 4), dtype=rhoE.dtype)
-        Be = np.zeros((self.nelems, 2, 4))
-
-        # Compute the x and y coordinates of each element
-        xe = self.X[self.conn, 0]
-        ye = self.X[self.conn, 1]
 
         for j in range(2):
             for i in range(2):
-                xi = gauss_pts[i]
-                eta = gauss_pts[j]
-                detJ = populate_thermal_Be(self.nelems, xi, eta, xe, ye, Be)
+                Be = self.Be[:, :, :, 2 * j + i]
+                detJ = self.detJ[:, 2 * j + i]
 
                 # This is a fancy (and fast) way to compute the element matrices
                 Ke += np.einsum("n,nij,nik -> njk", kappa * detJ, Be, Be)
@@ -142,9 +155,6 @@ class ThermalTopologyAnalysis:
         # Derivative w.r.t. kappa
         dfdk = np.zeros(self.nelems)
 
-        # Compute the element stiffness matrix
-        gauss_pts = [-1.0 / np.sqrt(3.0), 1.0 / np.sqrt(3.0)]
-
         # The element-wise variables
         ue = np.zeros((self.nelems, 4))
         psie = np.zeros((self.nelems, 4))
@@ -152,24 +162,25 @@ class ThermalTopologyAnalysis:
         ue = u[self.conn, ...]
         psie = psi[self.conn, ...]
 
-        Be = np.zeros((self.nelems, 2, 4))
-        xe = self.X[self.conn, 0]
-        ye = self.X[self.conn, 1]
-
         if u.ndim == 1 and psi.ndim == 1:
             for j in range(2):
                 for i in range(2):
-                    xi = gauss_pts[i]
-                    eta = gauss_pts[j]
-                    detJ = populate_thermal_Be(self.nelems, xi, eta, xe, ye, Be)
-                    dfdk += np.einsum("n,nim,nil,nm,nl -> n", detJ, Be, Be, psie, ue)
+                    Be = self.Be[:, :, :, 2 * j + i]
+                    detJ = self.detJ[:, 2 * j + i]
+
+                    se = np.einsum("nij,nj -> ni", Be, psie)
+                    te = np.einsum("nij,nj -> ni", Be, ue)
+                    dfdk += np.einsum("n,ni,ni -> n", detJ, se, te)
+
         elif u.ndim == 2 and psi.ndim == 2:
             for j in range(2):
                 for i in range(2):
-                    xi = gauss_pts[i]
-                    eta = gauss_pts[j]
-                    detJ = populate_thermal_Be(self.nelems, xi, eta, xe, ye, Be)
-                    dfdk += np.einsum("n,nim,nil,nmk,nlk -> n", detJ, Be, Be, psie, ue)
+                    Be = self.Be[:, :, :, 2 * j + i]
+                    detJ = self.detJ[:, 2 * j + i]
+
+                    se = Be @ psie
+                    te = Be @ ue
+                    dfdk += detJ * np.einsum("nik,nik -> n", se, te)
 
         # Compute the derivative w.r.t. rhoE
         dfdrhoE = (
@@ -186,24 +197,13 @@ class ThermalTopologyAnalysis:
         # Compute the element density
         c = self.heat_capacity * self.density * ((1.0 - self.beta) * rhoE + self.beta)
 
-        # Compute the element stiffness matrix
-        gauss_pts = [-1.0 / np.sqrt(3.0), 1.0 / np.sqrt(3.0)]
-
         # Assemble all of the the 8 x 8 element mass matrices
         Me = np.zeros((self.nelems, 4, 4), dtype=rhoE.dtype)
 
-        # Set the interpolation matrices for all of the elements
-        He = np.zeros((self.nelems, 4))
-
-        # Compute the x and y coordinates of each element
-        xe = self.X[self.conn, 0]
-        ye = self.X[self.conn, 1]
-
         for j in range(2):
             for i in range(2):
-                xi = gauss_pts[i]
-                eta = gauss_pts[j]
-                detJ = populate_thermal_He(self.nelems, xi, eta, xe, ye, He)
+                He = self.He[:, :, 2 * j + i]
+                detJ = self.detJ[:, 2 * j + i]
 
                 # This is a fancy (and fast) way to compute the element matrices
                 Me += np.einsum("n,ni,nj -> nij", c * detJ, He, He)
@@ -221,33 +221,24 @@ class ThermalTopologyAnalysis:
         # Derivative with respect to element density
         dfdrhoE = np.zeros(self.nelems)
 
-        # Compute the element stiffness matrix
-        gauss_pts = [-1.0 / np.sqrt(3.0), 1.0 / np.sqrt(3.0)]
-
         # The element-wise variables
         ue = u[self.conn, ...]
         ve = v[self.conn, ...]
 
-        # The interpolation matrix for each element
-        He = np.zeros((self.nelems, 4))
-
-        # Compute the x and y coordinates of each element
-        xe = self.X[self.conn, 0]
-        ye = self.X[self.conn, 1]
-
         if u.ndim == 1 and v.ndim == 1:
             for j in range(2):
                 for i in range(2):
-                    xi = gauss_pts[i]
-                    eta = gauss_pts[j]
-                    detJ = populate_thermal_He(self.nelems, xi, eta, xe, ye, He)
+                    He = self.He[:, :, 2 * j + i]
+                    detJ = self.detJ[:, 2 * j + i]
+
                     dfdrhoE += np.einsum("n,ni,nj,ni,nj -> n", detJ, He, He, ue, ve)
+
         elif u.ndim == 2 and v.ndim == 2:
             for j in range(2):
                 for i in range(2):
-                    xi = gauss_pts[i]
-                    eta = gauss_pts[j]
-                    detJ = populate_thermal_He(self.nelems, xi, eta, xe, ye, He)
+                    detJ = self.detJ[:, 2 * j + i]
+                    He = self.He[:, :, 2 * j + i]
+
                     dfdrhoE += np.einsum("n,ni,nj,nik,njk -> n", detJ, He, He, ue, ve)
 
         dfdrhoE[:] *= (1.0 - self.beta) * self.heat_capacity * self.density
@@ -362,6 +353,8 @@ class ThermalTopologyAnalysis:
             + self.rho[self.conn[:, 3]]
         )
 
+        self.detJ, self.Be, self.He = self.intital_thermal_Be_and_He()
+
         # Solve the eigenvalue problem
         self.lam, self.Q = self.solve_eigenvalue_problem(self.rhoE, store)
 
@@ -394,37 +387,10 @@ class ThermalTopologyAnalysis:
         )
 
     def eval_area(self):
-        area = 0.0
-        # Quadrature points
-        gauss_pts = [-1.0 / np.sqrt(3.0), 1.0 / np.sqrt(3.0)]
-        # Compute the x and y coordinates of each element
-        xe = self.X[self.conn, 0]
-        ye = self.X[self.conn, 1]
-        for j in range(2):
-            for i in range(2):
-                xi = gauss_pts[i]
-                eta = gauss_pts[j]
-                detJ = compute_detJ(self.nelems, xi, eta, xe, ye)
-                area += np.sum(detJ * self.rhoE)
-        return area
+        return np.sum(self.detJ.reshape(-1) * np.tile(self.rhoE, 4))
 
     def eval_area_gradient(self):
-        dfdrhoE = np.zeros(self.nelems)
-
-        # Quadrature points
-        gauss_pts = [-1.0 / np.sqrt(3.0), 1.0 / np.sqrt(3.0)]
-
-        # Compute the x and y coordinates of each element
-        xe = self.X[self.conn, 0]
-        ye = self.X[self.conn, 1]
-
-        for j in range(2):
-            for i in range(2):
-                xi = gauss_pts[i]
-                eta = gauss_pts[j]
-                detJ = compute_detJ(self.nelems, xi, eta, xe, ye)
-
-                dfdrhoE[:] += detJ
+        dfdrhoE = np.sum(self.detJ, axis=1)
 
         dfdrho = np.zeros(self.nnodes)
         for i in range(4):
@@ -481,7 +447,7 @@ class ThermalTopologyAnalysis:
 
         # Tanh aggregate
         lam_a = 0.0
-        lam_b = 40.0
+        lam_b = 50.0
         a = np.tanh(rho * (self.lam[1:] - lam_a))
         b = np.tanh(rho * (self.lam[1:] - lam_b))
         eta = a - b
@@ -491,17 +457,15 @@ class ThermalTopologyAnalysis:
 
         h = 0.0
         for i in range(1, self.N):
-            h += eta[i - 1] * self.Q[node, i] ** 2
+            h += eta[i - 1] * np.dot(self.Q[node, i], self.Q[node, i])
 
         return h
 
     def add_eigenvector_aggregate_derivative(self, hb, rho, node):
-        # Exponential aggregate
-        # eta = np.exp(-rho * (self.lam[1:] - np.min(self.lam[1:])))
 
         # Tanh aggregate
         lam_a = 0.0
-        lam_b = 40.0
+        lam_b = 50.0
         a = np.tanh(rho * (self.lam[1:] - lam_a))
         b = np.tanh(rho * (self.lam[1:] - lam_b))
         eta = a - b
@@ -511,18 +475,71 @@ class ThermalTopologyAnalysis:
 
         h = 0.0
         for i in range(1, self.N):
-            h += eta[i - 1] * self.Q[node, i] ** 2
+            h += eta[i - 1] * np.dot(self.Q[node, i], self.Q[node, i])
 
         for i in range(1, self.N):
             self.Qb[node, i] += 2.0 * hb * eta[i - 1] * self.Q[node, i]
 
-            # self.lamb[i] -= hb * rho * eta[i - 1] * (self.Q[node, i] ** 2 - h)
             self.lamb[i] -= (
                 hb
                 * rho
                 * eta[i - 1]
                 * (a[i - 1] + b[i - 1])
-                * (self.Q[node, i] ** 2 - h)
+                * (np.dot(self.Q[node, i], self.Q[node, i]) - h)
+            )
+
+        return
+
+    def KSmax(self, q, ks_rho):
+        c = np.max(q)
+        eta = np.exp(ks_rho * (q - c))
+        ks_max = c + np.log(np.sum(eta)) / ks_rho
+        return ks_max
+
+    def eigenvector_aggregate_magnitude(self, rho, node):
+        # Tanh aggregate
+        lam_a = 0.0
+        lam_b = 1000.0
+        a = np.tanh(rho * (self.lam[1:] - lam_a))
+        b = np.tanh(rho * (self.lam[1:] - lam_b))
+        eta = a - b
+
+        # Normalize the weights
+        eta = eta / np.sum(eta)
+
+        h = 0.0
+        for i in range(1, self.N):
+            h += eta[i - 1] * self.Q[node, i] ** 2
+
+        return h, eta, a, b
+
+    def get_eigenvector_aggregate_max(self, rho, node):
+        h, _, _, _ = self.eigenvector_aggregate_magnitude(rho, node)
+        h = self.KSmax(h, rho)
+        return h
+
+    def add_eigenvector_aggregate_max_derivative(self, hb, rho, node):
+        h_mag, eta, a, b = self.eigenvector_aggregate_magnitude(rho, node)
+
+        eta_h = np.exp(rho * (h_mag - np.max(h_mag)))
+        eta_h = eta_h / np.sum(eta_h)
+
+        h = np.dot(eta_h, h_mag)
+
+        def D(q):
+            eta_Dq = np.zeros(len(q))
+            for i in range(len(eta_h)):
+                eta_Dq[i] = eta_h[i] * q[i]
+            return eta_Dq
+
+        for i in range(1, self.N):
+            self.Qb[node, i] += 2.0 * hb * eta[i - 1] * D(self.Q[node, i])
+            self.lamb[i] -= (
+                hb
+                * rho
+                * eta[i - 1]
+                * (a[i - 1] + b[i - 1])
+                * (self.Q[node, i].T @ D(self.Q[node, i]) - h)
             )
 
         return
@@ -551,7 +568,6 @@ class ThermalTopologyAnalysis:
 
         callback = Callback()
 
-        # self.profile["adjoint solution method"] = self.adjoint_method
         self.factor.count = 0
 
         # Solve the adjoint problem
@@ -575,6 +591,7 @@ class ThermalTopologyAnalysis:
         self.profile["adjoint preconditioner count"] = self.factor.count
         self.profile["adjoint solution time"] = t
         self.profile["adjoint residuals"] = np.array(callback.res_list).tolist()
+        self.profile["adjoint iterations"] = len(callback.res_list)
         self.profile["adjoint correction data"] = corr_data
 
         dAdx = lambda w, v: self.get_stiffness_matrix_deriv(self.rhoE, w, v)
@@ -621,6 +638,7 @@ class ThermalTopologyAnalysis:
         hb = 1.0
         self.add_eigenvector_aggregate_derivative(hb, rho, node)
         self.finalize_adjoint()
+        self.add_check_adjoint_residual(b_ortho=True)
 
         # Set a random perturbation to the design variables
         if pert is None:
@@ -707,6 +725,7 @@ class ThermalTopologyAnalysis:
         self.initialize_adjoint()
         self.add_mean_derivatives(coefb)
         self.finalize_adjoint()
+        self.add_check_adjoint_residual(b_ortho=True)
 
         # The exact derivative
         data = {}
@@ -772,9 +791,7 @@ class ThermalTopologyAnalysis:
 
         return data
 
-    def test_compliance_derivatives(
-        self, vec=None, dh_cs=1e-6, dh_fd=1e-6, dh_cd=1e-4, pert=None
-    ):
+    def test_compliance_derivatives(self, vec=None, dh_cs=1e-6, dh_cd=1e-4, pert=None):
         if vec is None:
             vec = np.random.uniform(size=self.nnodes)
 
@@ -812,16 +829,6 @@ class ThermalTopologyAnalysis:
             data["cs"] = h1.imag / dh_cs
             data["cs_err"] = np.fabs((data["ans"] - data["cs"]) / data["cs"])
 
-        # Perturb the design variables for finite-difference
-        self.x = x0 + dh_fd * pert
-        self.initialize()
-        h2 = self.get_thermal_compliance(vec)
-
-        # Compute the finite-difference and relative error
-        data["dh_fd"] = dh_fd
-        data["fd"] = (h2 - h) / dh_fd
-        data["fd_err"] = np.fabs((data["ans"] - data["fd"]) / data["fd"])
-
         self.x = x0 - dh_cd * pert
         self.initialize()
         h3 = self.get_thermal_compliance(vec)
@@ -840,33 +847,29 @@ class ThermalTopologyAnalysis:
 
         if self.solver_type == "BasicLanczos":
             print(
-                "%25s  %25s  %25s  %25s  %25s %25s %25s"
+                "%25s  %25s  %25s  %25s  %25s"
                 % (
                     "Answer",
                     "CS",
-                    "FD",
                     "CD",
                     "CS Rel Error",
-                    "FD Rel Error",
                     "CD Rel Error",
                 )
             )
             print(
-                "%25.15e  %25.15e  %25.15e  %25.15e  %25.15e  %25.15e  %25.15e"
+                "%25.15e  %25.15e  %25.15e  %25.15e  %25.15e"
                 % (
                     data["ans"],
                     data["cs"],
-                    data["fd"],
                     data["cd"],
                     data["cs_err"],
-                    data["fd_err"],
                     data["cd_err"],
                 )
             )
         else:
-            print("%25s  %25s  %25s" % ("Answer", "FD", "FD Rel Error"))
+            print("%25s  %25s  %25s" % ("Answer", "CD", "CD Rel Error"))
             print(
-                "%25.15e  %25.15e  %25.15e" % (data["ans"], data["fd"], data["fd_err"])
+                "%25.15e  %25.15e  %25.15e" % (data["ans"], data["cd"], data["cd_err"])
             )
 
         return data
@@ -906,7 +909,7 @@ class ThermalTopologyAnalysis:
 
         return
 
-    def plot_design(self, set1=None, set2=None, path=None):
+    def plot_design(self, set1=None, set2=None, path=None, node=None):
         fig, ax = plt.subplots()
         self.plot(self.rho, ax=ax)
         ax.set_aspect("equal")
@@ -925,8 +928,19 @@ class ThermalTopologyAnalysis:
                     ye = self.X[self.conn[e, :], 1]
                     ax.fill(xe, ye, edgecolor="none", facecolor="blue", alpha=0.25)
 
+        if node is not None:
+            ax.plot(
+                self.X[node, 0],
+                self.X[node, 1],
+                "o",
+                markersize=1,
+                alpha=0.5,
+                markeredgecolor="none",
+                markerfacecolor="b",
+            )
+
         if path is not None:
-            fig.savefig(path, bbox_inches="tight", dpi=300)
+            fig.savefig(path, bbox_inches="tight", dpi=150)
 
         plt.close(fig)
 
@@ -1008,11 +1022,11 @@ class ThermalOpt:
         self.con_scale = 1.0
 
         # Set up the compliance function vector
+        self.vec = np.ones(self.topo.nnodes)
         if self.compliance_func is not None:
-            self.vec = np.ones(self.topo.nnodes)
             for key in self.compliance_func:
                 if key in self.topo.mean_vecs:
-                    self.vec += self.compliance_func[key] * self.topo.mean_vecs[key]
+                    self.vec += self.compliance_func[key][0] * self.topo.mean_vecs[key]
 
         return
 
@@ -1056,8 +1070,19 @@ class ThermalOpt:
         return self.topo.get_thermal_compliance(self.vec)
 
     def add_thermal_compliance_derivative(self, scale=1.0):
-        self.topo.add_thermal_compliance_derivative(scale, self.vec)
-        return
+        return self.topo.add_thermal_compliance_derivative(scale, self.vec)
+
+    def get_eigenvector_aggregate(self, rho, node):
+        return self.topo.get_eigenvector_aggregate(rho, node)
+
+    def add_eigenvector_aggregate_derivative(self, hb, rho, node):
+        return self.topo.add_eigenvector_aggregate_derivative(hb, rho, node)
+
+    def get_eigenvector_aggregate_max(self, rho, node):
+        return self.topo.get_eigenvector_aggregate_max(rho, node)
+
+    def add_eigenvector_aggregate_max_derivative(self, hb, rho, node):
+        return self.topo.add_eigenvector_aggregate_max_derivative(hb, rho, node)
 
     def eval_ks_functions(self, rho):
         ks = {}
@@ -1135,6 +1160,7 @@ class ThermalOpt:
         self.initialize_adjoint()
         self.add_ks_derivative(rho, ksb)
         self.finalize_adjoint()
+        self.topo.add_check_adjoint_residual(b_ortho=True)
 
         # Set a random perturbation to the design variables
         if pert is None:
@@ -1192,16 +1218,16 @@ class ThermalOpt:
         if self.topo.solver_type == "BasicLanczos":
             print(
                 "%25s  %25s  %25s  %25s  %25s"
-                % ("Answer", "CS", "FD", "CS Rel Error", "FD Rel Error")
+                % ("Answer", "CS", "CD", "CS Rel Error", "CD Rel Error")
             )
             print(
                 "%25.15e  %25.15e  %25.15e  %25.15e  %25.15e"
-                % (data["ans"], data["cs"], data["fd"], data["cs_err"], data["fd_err"])
+                % (data["ans"], data["cs"], data["cd"], data["cs_err"], data["cd_err"])
             )
         else:
-            print("%25s  %25s  %25s" % ("Answer", "FD", "FD Rel Error"))
+            print("%25s  %25s  %25s" % ("Answer", "CD", "CD Rel Error"))
             print(
-                "%25.15e  %25.15e  %25.15e" % (data["ans"], data["fd"], data["fd_err"])
+                "%25.15e  %25.15e  %25.15e" % (data["ans"], data["cd"], data["cd_err"])
             )
 
         return data
@@ -1344,6 +1370,9 @@ class ThermalOpt:
                 ax.axis("off")
                 fig.savefig(path(k), bbox_inches="tight")
                 plt.close()
+
+            return u
+
         elif hist == "full":
             M = self.topo.M
             K = self.topo.K
@@ -1358,7 +1387,7 @@ class ThermalOpt:
                 fig.savefig(path(k), bbox_inches="tight")
                 plt.close()
 
-        return
+            return u[:, k]
 
     def full_model_integration(self, case, M, K, mean_vecs):
         beta = 1.0 / self.dt
@@ -1509,17 +1538,17 @@ def make_opt_model(nx=256, Lx=1.0, rfact=4.0, epsilon=0.0, element_sets=None, **
         element_sets = {}
 
     if "center" in element_sets:
-        for j in range(3 * nx // 8, 5 * nx // 8):
-            for i in range(3 * nx // 8, 5 * nx // 8):
+        for j in range(2 * nx // 5, 3 * nx // 5):
+            for i in range(2 * nx // 5, 3 * nx // 5):
                 element_sets["center"].append(i + nx * j)
 
     for k in range(4):
         key = "corner%d" % (k)
         if key in element_sets:
-            istart = nx // 8 + (5 * nx // 8) * (k % 2)
-            iend = istart + nx // 8
-            jstart = nx // 8 + (5 * nx // 8) * (k // 2)
-            jend = jstart + nx // 8
+            istart = (3 * nx // 5) * (k % 2)
+            iend = istart + 2 * nx // 5
+            jstart = (3 * nx // 5) * (k // 2)
+            jend = jstart + 2 * nx // 5
 
             for j in range(jstart, jend):
                 for i in range(istart, iend):
@@ -1528,24 +1557,20 @@ def make_opt_model(nx=256, Lx=1.0, rfact=4.0, epsilon=0.0, element_sets=None, **
     for k in range(4):
         key = "edge%d" % (k)
         if key in element_sets:
-            # only consider the four edges i=0, i=nx, j=0, j=nx
-            offset = int(np.ceil(nx // 32))
-            if k == 0:
-                for i in range(nx):
-                    for j in range(offset):
-                        element_sets[key].append(i + nx * j)
-            elif k == 1:
-                for i in range(nx):
-                    for j in range(nx - offset, nx):
-                        element_sets[key].append(i + nx * j)
-            elif k == 2:
-                for j in range(offset, nx - offset):
-                    for i in range(offset):
-                        element_sets[key].append(i + nx * j)
-            elif k == 3:
-                for j in range(offset, nx - offset):
-                    for i in range(nx - offset, nx):
-                        element_sets[key].append(i + nx * j)
+            if k < 2:
+                istart = (3 * nx // 5) * (k % 2)
+                iend = istart + 2 * nx // 5
+                jstart = 2 * nx // 5
+                jend = jstart + nx // 5
+            else:
+                istart = 2 * nx // 5
+                iend = istart + nx // 5
+                jstart = (3 * nx // 5) * (k % 2)
+                jend = jstart + 2 * nx // 5
+
+            for j in range(jstart, jend):
+                for i in range(istart, iend):
+                    element_sets[key].append(i + nx * j)
 
     # Create the dv map
     dvmap = -np.ones((nx + 1, nx + 1), dtype=int)

@@ -1,22 +1,14 @@
 import time
 
-from eigd import (
-    IRAM,
-    BasicLanczos,
-    SpLuOperator,
-    eval_adjoint_residual_norm,
-)
-from fe_utils import (
-    compute_detJ,
-    populate_Be,
-    populate_He,
-)
+from fe_utils import populate_Be_and_He
 import matplotlib.pylab as plt
 import matplotlib.tri as tri
 from node_filter import NodeFilter
 import numpy as np
 from scipy import sparse
 from scipy.linalg import eigh
+
+from eigd import IRAM, BasicLanczos, SpLuOperator, eval_adjoint_residual_norm
 
 
 class TopologyAnalysis:
@@ -27,6 +19,7 @@ class TopologyAnalysis:
         conn,
         X,
         node_sets={},
+        element_sets={},
         E=1.0,
         nu=0.3,
         ptype_K="simp",
@@ -64,6 +57,7 @@ class TopologyAnalysis:
         self.N = N  # Number of modes
         self.m = m
         self.node_sets = node_sets
+        self.element_sets = element_sets
         self.solver_type = solver_type
         self.tol = tol
         self.rtol = rtol
@@ -112,6 +106,31 @@ class TopologyAnalysis:
         self._init_profile()
         return
 
+    def intital_Be_and_He(self):
+        # Compute the element stiffness matrix
+        gauss_pts = [-1.0 / np.sqrt(3.0), 1.0 / np.sqrt(3.0)]
+
+        # Compute the x and y coordinates of each element
+        xe = self.X[self.conn, 0]
+        ye = self.X[self.conn, 1]
+
+        # Compute Be and Te, detJ
+        Be = np.zeros((self.nelems, 3, 8, 4))
+        He = np.zeros((self.nelems, 2, 8, 4))
+        detJ = np.zeros((self.nelems, 4))
+
+        for j in range(2):
+            for i in range(2):
+                xi, eta = gauss_pts[i], gauss_pts[j]
+                index = 2 * i + j
+                Bei = Be[:, :, :, index]
+                Hei = He[:, :, :, index]
+                detJ[:, index] = populate_Be_and_He(
+                    self.nelems, xi, eta, xe, ye, Bei, Hei
+                )
+
+        return Be, He, detJ
+
     def get_stiffness_matrix(self, rhoE):
         """
         Assemble the stiffness matrix
@@ -125,25 +144,15 @@ class TopologyAnalysis:
 
         C = C.reshape((self.nelems, 3, 3))
 
-        # Compute the element stiffness matrix
-        gauss_pts = [-1.0 / np.sqrt(3.0), 1.0 / np.sqrt(3.0)]
-
         # Assemble all of the the 8 x 8 element stiffness matrix
         Ke = np.zeros((self.nelems, 8, 8), dtype=rhoE.dtype)
-        Be = np.zeros((self.nelems, 3, 8))
-
-        # Compute the x and y coordinates of each element
-        xe = self.X[self.conn, 0]
-        ye = self.X[self.conn, 1]
 
         for j in range(2):
             for i in range(2):
-                xi = gauss_pts[i]
-                eta = gauss_pts[j]
-                detJ = populate_Be(self.nelems, xi, eta, xe, ye, Be)
+                detJ = self.detJ[:, 2 * i + j]
+                Be = self.Be[:, :, :, 2 * i + j]
 
-                # This is a fancy (and fast) way to compute the element matrices
-                Ke += np.einsum("n,nij,nik,nkl -> njl", detJ, Be, C, Be)
+                Ke += detJ[:, np.newaxis, np.newaxis] * Be.transpose(0, 2, 1) @ C @ Be
 
         K = sparse.coo_matrix((Ke.flatten(), (self.i, self.j)))
         K = K.tocsr()
@@ -157,9 +166,6 @@ class TopologyAnalysis:
 
         dfdrhoE = np.zeros(self.nelems)
 
-        # Compute the element stiffness matrix
-        gauss_pts = [-1.0 / np.sqrt(3.0), 1.0 / np.sqrt(3.0)]
-
         # The element-wise variables
         ue = np.zeros((self.nelems, 8) + u.shape[1:])
         psie = np.zeros((self.nelems, 8) + psi.shape[1:])
@@ -170,28 +176,24 @@ class TopologyAnalysis:
         psie[:, ::2, ...] = psi[2 * self.conn, ...]
         psie[:, 1::2, ...] = psi[2 * self.conn + 1, ...]
 
-        Be = np.zeros((self.nelems, 3, 8))
-        xe = self.X[self.conn, 0]
-        ye = self.X[self.conn, 1]
-
         if psi.ndim == 1 and u.ndim == 1:
             for j in range(2):
                 for i in range(2):
-                    xi = gauss_pts[i]
-                    eta = gauss_pts[j]
-                    detJ = populate_Be(self.nelems, xi, eta, xe, ye, Be)
+                    Be = self.Be[:, :, :, 2 * i + j]
+                    detJ = self.detJ[:, 2 * i + j]
+
                     se = np.einsum("nij,nj -> ni", Be, psie)
                     te = np.einsum("nij,nj -> ni", Be, ue)
                     dfdrhoE += np.einsum("n,ij,nj,ni -> n", detJ, self.C0, se, te)
         elif psi.ndim == 2 and u.ndim == 2:
             for j in range(2):
                 for i in range(2):
-                    xi = gauss_pts[i]
-                    eta = gauss_pts[j]
-                    detJ = populate_Be(self.nelems, xi, eta, xe, ye, Be)
-                    se = np.einsum("nij,njk -> nik", Be, psie)
-                    te = np.einsum("nij,njk -> nik", Be, ue)
-                    dfdrhoE += np.einsum("n,ij,njk,nik -> n", detJ, self.C0, se, te)
+                    Be = self.Be[:, :, :, 2 * i + j]
+                    detJ = self.detJ[:, 2 * i + j]
+
+                    se = Be @ psie
+                    te = Be @ ue
+                    dfdrhoE += detJ * np.einsum("ij,njk,nik -> n", self.C0, se, te)
 
         if self.ptype_K == "simp":
             dfdrhoE[:] *= self.p * rhoE ** (self.p - 1.0)
@@ -217,24 +219,13 @@ class TopologyAnalysis:
         else:  # linear
             density = self.density * rhoE
 
-        # Compute the element stiffness matrix
-        gauss_pts = [-1.0 / np.sqrt(3.0), 1.0 / np.sqrt(3.0)]
-
         # Assemble all of the the 8 x 8 element mass matrices
         Me = np.zeros((self.nelems, 8, 8), dtype=rhoE.dtype)
 
-        # Set the interpolation matrices for all of the elements
-        He = np.zeros((self.nelems, 2, 8))
-
-        # Compute the x and y coordinates of each element
-        xe = self.X[self.conn, 0]
-        ye = self.X[self.conn, 1]
-
         for j in range(2):
             for i in range(2):
-                xi = gauss_pts[i]
-                eta = gauss_pts[j]
-                detJ = populate_He(self.nelems, xi, eta, xe, ye, He)
+                detJ = self.detJ[:, 2 * i + j]
+                He = self.He[:, :, :, 2 * i + j]
 
                 # This is a fancy (and fast) way to compute the element matrices
                 Me += np.einsum("n,nij,nil -> njl", density * detJ, He, He)
@@ -252,9 +243,6 @@ class TopologyAnalysis:
         # Derivative with respect to element density
         dfdrhoE = np.zeros(self.nelems)
 
-        # Compute the element stiffness matrix
-        gauss_pts = [-1.0 / np.sqrt(3.0), 1.0 / np.sqrt(3.0)]
-
         # The element-wise variables
         ue = np.zeros((self.nelems, 8) + u.shape[1:])
         ve = np.zeros((self.nelems, 8) + v.shape[1:])
@@ -265,19 +253,11 @@ class TopologyAnalysis:
         ve[:, ::2, ...] = v[2 * self.conn, ...]
         ve[:, 1::2, ...] = v[2 * self.conn + 1, ...]
 
-        # The interpolation matrix for each element
-        He = np.zeros((self.nelems, 2, 8))
-
-        # Compute the x and y coordinates of each element
-        xe = self.X[self.conn, 0]
-        ye = self.X[self.conn, 1]
-
         if u.ndim == 1 and v.ndim == 1:
             for j in range(2):
                 for i in range(2):
-                    xi = gauss_pts[i]
-                    eta = gauss_pts[j]
-                    detJ = populate_He(self.nelems, xi, eta, xe, ye, He)
+                    He = self.He[:, :, :, 2 * i + j]
+                    detJ = self.detJ[:, 2 * i + j]
 
                     eu = np.einsum("nij,nj -> ni", He, ue)
                     ev = np.einsum("nij,nj -> ni", He, ve)
@@ -285,13 +265,12 @@ class TopologyAnalysis:
         elif u.ndim == 2 and v.ndim == 2:
             for j in range(2):
                 for i in range(2):
-                    xi = gauss_pts[i]
-                    eta = gauss_pts[j]
-                    detJ = populate_He(self.nelems, xi, eta, xe, ye, He)
+                    He = self.He[:, :, :, 2 * i + j]
+                    detJ = self.detJ[:, 2 * i + j]
 
-                    eu = np.einsum("nij,njk -> nik", He, ue)
-                    ev = np.einsum("nij,njk -> nik", He, ve)
-                    dfdrhoE += np.einsum("n,nik,nik -> n", detJ, eu, ev)
+                    eu = He @ ue
+                    ev = He @ ve
+                    dfdrhoE += detJ * np.einsum("nik,nik -> n", eu, ev)
 
         if self.ptype_M == "msimp":
             dnonlin = 6.0 * self.simp_c1 * rhoE**5.0 + 7.0 * self.simp_c2 * rhoE**6.0
@@ -304,23 +283,11 @@ class TopologyAnalysis:
 
         return dfdrhoE
 
+    def eval_area(self):
+        return np.sum(self.detJ.reshape(-1) * np.tile(self.rhoE, 4))
+
     def eval_area_gradient(self):
-        dfdrhoE = np.zeros(self.nelems)
-
-        # Quadrature points
-        gauss_pts = [-1.0 / np.sqrt(3.0), 1.0 / np.sqrt(3.0)]
-
-        # Compute the x and y coordinates of each element
-        xe = self.X[self.conn, 0]
-        ye = self.X[self.conn, 1]
-
-        for j in range(2):
-            for i in range(2):
-                xi = gauss_pts[i]
-                eta = gauss_pts[j]
-                detJ = compute_detJ(self.nelems, xi, eta, xe, ye)
-
-                dfdrhoE[:] += detJ
+        dfdrhoE = np.sum(self.detJ, axis=1)
 
         dfdrho = np.zeros(self.nnodes)
         for i in range(4):
@@ -347,7 +314,7 @@ class TopologyAnalysis:
 
         return
 
-    def solve_eigenvalue_problem(self, rhoE):
+    def solve_eigenvalue_problem(self, rhoE, store=False):
         """
         Compute the smallest natural frequencies
         """
@@ -399,6 +366,9 @@ class TopologyAnalysis:
                         self.sigma,
                     )
 
+                    if store:
+                        self.profile["eig_res"] = self.eig_solver.eig_res.tolist()
+
                 self.profile["solve preconditioner count"] = (
                     self.factor.count if i == 0 else None
                 )
@@ -421,7 +391,7 @@ class TopologyAnalysis:
 
         return lam0, Q0
 
-    def initialize(self):
+    def initialize(self, store=False):
         # Apply the filter
         self.rho = self.fltr.apply(self.x)
 
@@ -433,10 +403,15 @@ class TopologyAnalysis:
             + self.rho[self.conn[:, 3]]
         )
 
+        self.Be, self.He, self.detJ = self.intital_Be_and_He()
+
         # Solve the eigenvalue problem
-        self.lam, self.Q = self.solve_eigenvalue_problem(self.rhoE)
+        self.lam, self.Q = self.solve_eigenvalue_problem(self.rhoE, store)
 
         self.profile["natural frequencies"] = np.sqrt(self.lam).tolist()
+
+        if store:
+            self.profile["eigenvalues"] = self.lam.tolist()
 
         return
 
@@ -459,9 +434,9 @@ class TopologyAnalysis:
 
         return res
 
-    def add_check_adjoint_residual(self):
+    def add_check_adjoint_residual(self, b_ortho=False):
         return self.check_adjoint_residual(
-            self.K, self.M, self.lam, self.Q, self.Qb, self.psi, b_ortho=False
+            self.K, self.M, self.lam, self.Q, self.Qb, self.psi, b_ortho=b_ortho
         )
 
     def finalize_adjoint(self):
@@ -512,7 +487,7 @@ class TopologyAnalysis:
         for i in data:
             if i >= 3:
                 items = []
-                for j, xi, eta in data:
+                for j, xi, eta in data[i]:
                     if j >= 3:
                         items.append((j, xi, eta))
                 if len(items) > 0:
@@ -642,14 +617,21 @@ class TopologyAnalysis:
 
         return
 
-    def plot_design(self, path=None):
+    def plot_design(self, path=None, node_sets=False):
         fig, ax = plt.subplots()
         self.plot(self.rho, ax=ax)
         ax.set_aspect("equal")
         ax.axis("off")
 
+        if node_sets:
+            for name in self.node_sets:
+                for e in self.element_sets[name]:
+                    xe = self.X[self.conn[e], 0]
+                    ye = self.X[self.conn[e], 1]
+                    ax.fill(xe, ye, "b", alpha=0.25)
+
         if path is not None:
-            fig.savefig(path, bbox_inches="tight", dpi=300)
+            fig.savefig(path, bbox_inches="tight", dpi=150)
 
         plt.close(fig)
 
@@ -675,9 +657,6 @@ class TopologyAnalysis:
             # Set the number of levels to use.
             levels = np.linspace(0.0, 1.0, 26)
 
-            # Make sure that there are no ticks on either axis (these affect the bounding-box
-            # and make extra white-space at the corners). Finally, turn off the axis so its
-            # not visible.
             ax.get_xaxis().set_ticks([])
             ax.get_yaxis().set_ticks([])
             ax.axis("off")
@@ -722,15 +701,13 @@ class MinFreqOpt:
         self.ks_min = 0.0
         self.node_sets = self.topo.node_sets
 
-        self.area_gradient = self.topo.eval_area_gradient()
-
         self.coef = {}
         self.coefb = {}
         self.omega = None
         self.omegab = None
 
-    def initialize(self):
-        self.topo.initialize()
+    def initialize(self, store=False):
+        self.topo.initialize(store)
 
         # Get the natural frequencies
         self.omega = self.topo.get_frequencies()
@@ -769,7 +746,7 @@ class MinFreqOpt:
         ks0vals = {}
         eigs = {}
 
-        min_val = np.max(omega)
+        min_val = np.min(omega)
         for name in xcoef:
             c0 = xcoef[name]
             M0 = np.eye(N) + fixed_mass * np.dot(c0.T, c0)
@@ -831,7 +808,7 @@ class MinFreqOpt:
 
     def test_ks_func(self, dh_cs=1e-6, dh_fd=1e-6, pert=None):
         # Initialize the problem
-        self.initialize()
+        self.initialize(store=True)
         ks1 = self.get_min_frequency()
 
         # Copy the design variables
@@ -840,6 +817,7 @@ class MinFreqOpt:
         # Create the derivatives
         self.initialize_adjoint()
         self.finalize_adjoint()
+        self.topo.add_check_adjoint_residual(b_ortho=True)
 
         # Set a random perturbation to the design variables
         if pert is None:
@@ -919,22 +897,48 @@ def make_model(
     dvmap = np.zeros((nx + 1, ny + 1), dtype=int)
 
     node_sets = {}
+    element_sets = {}
+
+    # Make sure that ns is at least rfact
+    ns = max(int(ns * ny // 32), int(rfact // 2))
+
+    sx = nx // (Mx - 1)
+    sy = ny // (My - 1)
+
     for i in range(Mx):
         for j in range(My):
-            name = "node[%d,%d]" % (i, j)
-            node_set = []
+            if True:
+                name = "node[%d,%d]" % (i, j)
+                node_set = []
+                element_set = []
 
-            imin = max(0, (nx // (Mx - 1)) * i - ns)
-            imax = min(nx, (nx // (Mx - 1)) * i + ns + 1)
+                # make sure that the node set is symmetric
+                if i < Mx // 2:
+                    imin = max(0, sx * i - ns + 1)
+                    imax = min(nx, sx * i + ns + 1)
+                else:
+                    imin_temp = max(0, sx * (Mx - i - 1) - ns + 1)
+                    imax_temp = min(nx, sx * (Mx - i - 1) + ns + 1)
+                    imin = max(0, nx - imax_temp)
+                    imax = min(nx, nx - imin_temp)
 
-            jmin = max(0, (ny // (My - 1)) * j - ns)
-            jmax = min(ny, (ny // (My - 1)) * j + ns + 1)
+                if j < My // 2:
+                    jmin = max(0, sy * j - ns)
+                    jmax = min(ny, sy * j + ns)
+                else:
+                    jmin_temp = max(0, sy * (My - j - 1) - ns)
+                    jmax_temp = min(ny, sy * (My - j - 1) + ns)
+                    jmin = max(0, ny - jmax_temp)
+                    jmax = min(ny, ny - jmin_temp)
 
             for ii in range(imin, imax):
                 for jj in range(jmin, jmax):
                     node_set.append(nodes[ii, jj])
+                    element_set.append(ii + nx * jj)
                     dvmap[ii, jj] = -1
+
             node_sets[name] = np.array(node_set, dtype=int)
+            element_sets[name] = np.array(element_set, dtype=int)
 
     index = 0
     for i in range(nx // 2 + 1):
@@ -965,7 +969,21 @@ def make_model(
     if "b0" in kwargs:
         del kwargs["b0"]
 
-    topo = TopologyAnalysis(fltr, conn, X, N=N, node_sets=node_sets, **kwargs)
+    topo = TopologyAnalysis(
+        fltr, conn, X, N=N, node_sets=node_sets, element_sets=element_sets, **kwargs
+    )
+
+    return topo
+
+
+def make_opt_model(ny=96, rfact=4.0, N=10, Mx=3, My=3, ns=2, **kwargs):
+    nx = 4 * ny
+    Lx = 4.0
+    Ly = 1.0
+
+    topo = make_model(
+        nx=nx, ny=ny, Lx=Lx, Ly=Ly, rfact=rfact, N=N, Mx=Mx, My=My, ns=ns, **kwargs
+    )
 
     return topo
 
@@ -976,6 +994,9 @@ if __name__ == "__main__":
     import sys
 
     solver_type = "IRAM"
+    if "BasicLanczos" in sys.argv:
+        solver_type = "BasicLanczos"
+
     if "dl" in sys.argv:
         solver_type = "BasicLanczos"
         method = "dl"
