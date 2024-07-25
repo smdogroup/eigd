@@ -7,17 +7,16 @@ __version__ = re.findall(
     open("eigd/__init__.py").read(),
 )[0]
 
-# this_directory = os.path.abspath(os.path.dirname(__file__))
-# with open(os.path.join(this_directory, "README.md"), encoding="utf-8") as f:
-#     long_description = f.read()
-
+this_directory = os.path.abspath(os.path.dirname(__file__))
+with open(os.path.join(this_directory, "README.md"), encoding="utf-8") as f:
+    long_description = f.read()
 
 setup(
     name="eigd",
     version=__version__,
     description="Tools for eigenvector derivatives",
-    # long_description=long_description,
-    # long_description_content_type="text/markdown",
+    long_description=long_description,
+    long_description_content_type="text/markdown",
     keywords="",
     author="",
     author_email="graeme.kennedy@ae.gatech.edu",
