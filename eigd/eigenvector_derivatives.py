@@ -1543,7 +1543,10 @@ class BasicLanczos:
                     )
 
                     Y0 = Y[:, indices]
-                    if self._eigenvalues_converged(self.beta, Y0, i, self.N, self.tol):
+                    N = self.N
+                    if self.Ntarget is not None:
+                        N = self.Ntarget
+                    if self._eigenvalues_converged(self.beta, Y0, i, N, self.tol):
                         self.m = i
                         break
 
@@ -1583,7 +1586,10 @@ class BasicLanczos:
                     # Sort the eigenvectors by index
                     Y0 = Y[:, indices]
 
-                    if self._eigenvalues_converged(self.beta, Y0, i, self.N, self.tol):
+                    N = self.N
+                    if self.Ntarget is not None:
+                        N = self.Ntarget
+                    if self._eigenvalues_converged(self.beta, Y0, i, N, self.tol):
                         self.m = i
                         break
 

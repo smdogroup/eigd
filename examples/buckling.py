@@ -1,17 +1,6 @@
 import time
 
-from eigd import (
-    IRAM,
-    BasicLanczos,
-    SpLuOperator,
-    eval_adjoint_residual_norm,
-)
-from fe_utils import (
-    compute_detJ,
-    populate_Be,
-    populate_Be_and_Te,
-    populate_He,
-)
+from fe_utils import populate_Be_and_Te
 import matplotlib.pylab as plt
 import matplotlib.tri as tri
 from node_filter import NodeFilter
@@ -19,6 +8,8 @@ import numpy as np
 from scipy import sparse
 from scipy.linalg import eigh
 from scipy.sparse import linalg
+
+from eigd import IRAM, BasicLanczos, SpLuOperator, eval_adjoint_residual_norm
 
 
 class TopologyAnalysis:
@@ -79,6 +70,9 @@ class TopologyAnalysis:
         self.cost = cost
         self.deriv_type = deriv_type
 
+        self.bcs = bcs
+        self.forces = forces
+
         self.nelems = self.conn.shape[0]
         self.nnodes = int(np.max(self.conn)) + 1
         self.nvars = 2 * self.nnodes
@@ -106,6 +100,9 @@ class TopologyAnalysis:
         self.var = np.zeros((self.conn.shape[0], 8), dtype=int)
         self.var[:, ::2] = 2 * self.conn
         self.var[:, 1::2] = 2 * self.conn + 1
+
+        self.dfds = None
+        self.pp = None
 
         i = []
         j = []
@@ -165,25 +162,13 @@ class TopologyAnalysis:
 
         C = C.reshape((self.nelems, 3, 3))
 
-        # Compute the element stiffness matrix
-        gauss_pts = [-1.0 / np.sqrt(3.0), 1.0 / np.sqrt(3.0)]
-
         # Assemble all of the the 8 x 8 element stiffness matrix
         Ke = np.zeros((self.nelems, 8, 8), dtype=rhoE.dtype)
-        Be = np.zeros((self.nelems, 3, 8))
 
-        # Compute the x and y coordinates of each element
-        xe = self.X[self.conn, 0]
-        ye = self.X[self.conn, 1]
-
-        for j in range(2):
-            for i in range(2):
-                xi = gauss_pts[i]
-                eta = gauss_pts[j]
-                detJ = populate_Be(self.nelems, xi, eta, xe, ye, Be)
-
-                # This is a fancy (and fast) way to compute the element matrices
-                Ke += np.einsum("n,nij,nik,nkl -> njl", detJ, Be, C, Be)
+        for i in range(4):
+            Be = self.Be[:, :, :, i]
+            detJ = self.detJ[:, i]
+            Ke += detJ[:, np.newaxis, np.newaxis] * Be.transpose(0, 2, 1) @ C @ Be
 
         K = sparse.coo_matrix((Ke.flatten(), (self.i, self.j)))
         K = K.tocsr()
@@ -197,9 +182,6 @@ class TopologyAnalysis:
 
         dfdrhoE = np.zeros(self.nelems)
 
-        # Compute the element stiffness matrix
-        gauss_pts = [-1.0 / np.sqrt(3.0), 1.0 / np.sqrt(3.0)]
-
         # The element-wise variables
         ue = np.zeros((self.nelems, 8) + u.shape[1:])
         psie = np.zeros((self.nelems, 8) + psi.shape[1:])
@@ -210,28 +192,18 @@ class TopologyAnalysis:
         psie[:, ::2, ...] = psi[2 * self.conn, ...]
         psie[:, 1::2, ...] = psi[2 * self.conn + 1, ...]
 
-        Be = np.zeros((self.nelems, 3, 8))
-        xe = self.X[self.conn, 0]
-        ye = self.X[self.conn, 1]
+        for i in range(4):
+            Be = self.Be[:, :, :, i]
+            detJ = self.detJ[:, i]
 
-        if psi.ndim == 1 and u.ndim == 1:
-            for j in range(2):
-                for i in range(2):
-                    xi = gauss_pts[i]
-                    eta = gauss_pts[j]
-                    detJ = populate_Be(self.nelems, xi, eta, xe, ye, Be)
-                    se = np.einsum("nij,nj -> ni", Be, psie)
-                    te = np.einsum("nij,nj -> ni", Be, ue)
-                    dfdrhoE += np.einsum("n,ij,nj,ni -> n", detJ, self.C0, se, te)
-        elif psi.ndim == 2 and u.ndim == 2:
-            for j in range(2):
-                for i in range(2):
-                    xi = gauss_pts[i]
-                    eta = gauss_pts[j]
-                    detJ = populate_Be(self.nelems, xi, eta, xe, ye, Be)
-                    se = np.einsum("nij,njk -> nik", Be, psie)
-                    te = np.einsum("nij,njk -> nik", Be, ue)
-                    dfdrhoE += np.einsum("n,ij,njk,nik -> n", detJ, self.C0, se, te)
+            if psi.ndim == 1 and u.ndim == 1:
+                se = np.einsum("nij,nj -> ni", Be, psie)
+                te = np.einsum("nij,nj -> ni", Be, ue)
+                dfdrhoE += detJ * np.einsum("ij,nj,ni -> n", self.C0, se, te)
+            elif psi.ndim == 2 and u.ndim == 2:
+                se = Be @ psie
+                te = Be @ ue
+                dfdrhoE += detJ * np.einsum("ij,njk,nik -> n", self.C0, se, te)
 
         if self.ptype_K == "simp":
             dfdrhoE[:] *= self.p * rhoE ** (self.p - 1.0)
@@ -263,34 +235,109 @@ class TopologyAnalysis:
 
         C = C.reshape((self.nelems, 3, 3))
 
-        # Compute the element stiffness matrix
-        gauss_pts = [-1.0 / np.sqrt(3.0), 1.0 / np.sqrt(3.0)]
-
         Ge = np.zeros((self.nelems, 8, 8), dtype=rhoE.dtype)
-        Be = np.zeros((self.nelems, 3, 8))
-        Te = np.zeros((self.nelems, 3, 4, 4))
 
-        # Compute the x and y coordinates of each element
-        xe = self.X[self.conn, 0]
-        ye = self.X[self.conn, 1]
+        for i in range(4):
+            detJ = self.detJ[:, i]
+            Be = self.Be[:, :, :, i]
+            Te = self.Te[:, :, :, :, i]
 
-        for j in range(2):
-            for i in range(2):
-                xi = gauss_pts[i]
-                eta = gauss_pts[j]
-                detJ = populate_Be_and_Te(self.nelems, xi, eta, xe, ye, Be, Te)
+            # Compute the stresses in each element
+            s = np.einsum("nij,njk,nk -> ni", C, Be, ue)
 
-                # Compute the stresses in each element
-                s = np.einsum("nij,njk,nk -> ni", C, Be, ue)
-
-                G0e = np.einsum("n,ni,nijl -> njl", detJ, s, Te)
-                Ge[:, 0::2, 0::2] += G0e
-                Ge[:, 1::2, 1::2] += G0e
+            G0e = np.einsum("n,ni,nijl -> njl", detJ, s, Te)
+            Ge[:, 0::2, 0::2] += G0e
+            Ge[:, 1::2, 1::2] += G0e
 
         G = sparse.coo_matrix((Ge.flatten(), (self.i, self.j)))
         G = G.tocsr()
 
         return G
+
+    def intital_Be_and_Te(self):
+        # Compute gauss points
+        gauss_pts = [-1.0 / np.sqrt(3.0), 1.0 / np.sqrt(3.0)]
+
+        # Compute the x and y coordinates of each element
+        xe = self.X[self.conn, 0]
+        ye = self.X[self.conn, 1]
+
+        # Compute Be and Te, detJ
+        Be = np.zeros((self.nelems, 3, 8, 4))
+        Te = np.zeros((self.nelems, 3, 4, 4, 4))
+        detJ = np.zeros((self.nelems, 4))
+
+        for j in range(2):
+            for i in range(2):
+                xi, eta = gauss_pts[i], gauss_pts[j]
+                index = 2 * j + i
+                Bei = Be[:, :, :, index]
+                Tei = Te[:, :, :, :, index]
+
+                detJ[:, index] = populate_Be_and_Te(
+                    self.nelems, xi, eta, xe, ye, Bei, Tei
+                )
+
+        return Be, Te, detJ
+
+    def intital_stress_stiffness_matrix_deriv(self, rhoE, Te, detJ, psi, phi):
+
+        # Compute the element stiffnesses
+        if self.ptype_G == "simp":
+            C = np.outer(rhoE**self.p + self.rho0_G, self.C0)
+        else:  # ramp
+            C = np.outer(rhoE / (1.0 + self.q * (1.0 - rhoE)) + self.rho0_G, self.C0)
+
+        self.C = C.reshape((self.nelems, 3, 3))
+
+        # Compute the element-wise values of psi and phi
+        psie = np.zeros((self.nelems, 8) + psi.shape[1:])
+        psie[:, ::2, ...] = psi[2 * self.conn, ...]
+        psie[:, 1::2, ...] = psi[2 * self.conn + 1, ...]
+
+        phie = np.zeros((self.nelems, 8) + phi.shape[1:])
+        phie[:, ::2, ...] = phi[2 * self.conn, ...]
+        phie[:, 1::2, ...] = phi[2 * self.conn + 1, ...]
+
+        pp0 = psie[:, ::2] @ phie[:, ::2].transpose(0, 2, 1)
+        pp1 = psie[:, 1::2] @ phie[:, 1::2].transpose(0, 2, 1)
+
+        se = np.einsum("nijlm,njl -> nim", Te, (pp0 + pp1))
+        dfds = detJ[:, np.newaxis, :] * se
+
+        return dfds
+
+    def get_stress_stiffness_matrix_uderiv_tensor(self, dfds, Be):
+
+        Cdfds = self.C @ dfds
+        dfdue = np.einsum("nijm,nim -> nj", Be, Cdfds)
+
+        dfdu = np.zeros(2 * self.nnodes)
+        np.add.at(dfdu, 2 * self.conn, dfdue[:, 0::2])
+        np.add.at(dfdu, 2 * self.conn + 1, dfdue[:, 1::2])
+
+        return dfdu
+
+    def get_stress_stiffness_matrix_xderiv_tensor(self, rhoE, u, dfds, Be):
+
+        # The element-wise variables
+        ue = np.zeros((self.nelems, 8))
+        ue[:, ::2] = u[2 * self.conn]
+        ue[:, 1::2] = u[2 * self.conn + 1]
+
+        dfds = np.einsum("nim, ij -> njm", dfds, self.C0)
+        dfdrhoE = np.einsum("njm,njkm,nk -> n", dfds, Be, ue)
+
+        if self.ptype_G == "simp":
+            dfdrhoE[:] *= self.p * rhoE ** (self.p - 1)
+        else:  # ramp
+            dfdrhoE[:] *= (2.0 + self.q) / (1.0 + (self.q + 1.0) * (1.0 - rhoE)) ** 2
+
+        dfdrho = np.zeros(self.nnodes)
+        np.add.at(dfdrho, self.conn, dfdrhoE[:, np.newaxis])
+        dfdrho *= 0.25
+
+        return dfdrho
 
     def get_stress_stiffness_matrix_uderiv(self, rhoE, psi, phi):
         """
@@ -333,42 +380,26 @@ class TopologyAnalysis:
         xe = self.X[self.conn, 0]
         ye = self.X[self.conn, 1]
 
-        if psi.ndim == 1 and phi.ndim == 1:
-            for j in range(2):
-                for i in range(2):
-                    xi = gauss_pts[i]
-                    eta = gauss_pts[j]
-                    detJ = populate_Be_and_Te(self.nelems, xi, eta, xe, ye, Be, Te)
+        if psi.ndim == 2 and phi.ndim == 2 and self.pp is None:
+            pp0 = psie[:, ::2] @ phie[:, ::2].transpose(0, 2, 1)
+            pp1 = psie[:, 1::2] @ phie[:, 1::2].transpose(0, 2, 1)
+            self.pp = pp0 + pp1
 
-                    # Compute the derivative of the stress w.r.t. u
-                    se0 = np.einsum("nijl,nj,nl -> ni", Te, psie[:, ::2], phie[:, ::2])
-                    se1 = np.einsum(
-                        "nijl,nj,nl -> ni", Te, psie[:, 1::2], phie[:, 1::2]
-                    )
-                    se = se0 + se1
+        for xi, eta in [(xi, eta) for xi in gauss_pts for eta in gauss_pts]:
+            detJ = populate_Be_and_Te(self.nelems, xi, eta, xe, ye, Be, Te)
 
-                    # Add contributions to the derivative w.r.t. u
-                    dfdue += np.einsum("nij,nik,n,nk -> nj", Be, C, detJ, se)
+            if psi.ndim == 1 and phi.ndim == 1:
+                se0 = np.einsum("nijl,nj,nl -> ni", Te, psie[:, ::2], phie[:, ::2])
+                se1 = np.einsum("nijl,nj,nl -> ni", Te, psie[:, 1::2], phie[:, 1::2])
+                se = se0 + se1
 
-        elif psi.ndim == 2 and phi.ndim == 2:
-            for j in range(2):
-                for i in range(2):
-                    xi = gauss_pts[i]
-                    eta = gauss_pts[j]
-                    detJ = populate_Be_and_Te(self.nelems, xi, eta, xe, ye, Be, Te)
+            elif psi.ndim == 2 and phi.ndim == 2:
+                se = np.einsum("nijl,njl -> ni", Te, self.pp)
 
-                    # Compute the derivative of the stress w.r.t. u
-                    se0 = np.einsum(
-                        "nijl,njk,nlk -> ni", Te, psie[:, ::2, ...], phie[:, ::2, ...]
-                    )
-                    se1 = np.einsum(
-                        "nijl,njk,nlk -> ni", Te, psie[:, 1::2, ...], phie[:, 1::2, ...]
-                    )
-                    se = se0 + se1
-                    dfds = np.einsum("n,ni -> ni", detJ, se)
-
-                    # Add contributions to the derivative w.r.t. u
-                    dfdue += np.einsum("nij,nik,nk -> nj", Be, C, dfds)
+            # Add contributions to the derivative w.r.t. u
+            dfds = detJ[:, np.newaxis] * se
+            BeC = np.matmul(Be.transpose(0, 2, 1), C)
+            dfdue += np.einsum("njk,nk -> nj", BeC, dfds)
 
         dfdu = np.zeros(2 * self.nnodes)
         np.add.at(dfdu, 2 * self.conn, dfdue[:, 0::2])
@@ -422,43 +453,24 @@ class TopologyAnalysis:
         xe = self.X[self.conn, 0]
         ye = self.X[self.conn, 1]
 
-        if psi.ndim == 1 and phi.ndim == 1:
-            for j in range(2):
-                for i in range(2):
-                    xi = gauss_pts[i]
-                    eta = gauss_pts[j]
-                    detJ = populate_Be_and_Te(self.nelems, xi, eta, xe, ye, Be, Te)
+        if psi.ndim == 2 and phi.ndim == 2 and self.pp is None:
+            pp0 = psie[:, ::2] @ phie[:, ::2].transpose(0, 2, 1)
+            pp1 = psie[:, 1::2] @ phie[:, 1::2].transpose(0, 2, 1)
+            self.pp = pp0 + pp1
 
-                    # Compute the derivative of the stress w.r.t. u
-                    se0 = np.einsum("nijl,nj,nl -> ni", Te, psie[:, ::2], phie[:, ::2])
-                    se1 = np.einsum(
-                        "nijl,nj,nl -> ni", Te, psie[:, 1::2], phie[:, 1::2]
-                    )
-                    se = se0 + se1
-                    dfds = np.einsum("n,ij,ni -> nj", detJ, self.C0, se)
+        for xi, eta in [(xi, eta) for xi in gauss_pts for eta in gauss_pts]:
+            detJ = populate_Be_and_Te(self.nelems, xi, eta, xe, ye, Be, Te)
 
-                    # Add contributions to the derivative w.r.t. C
-                    dfdrhoE += np.einsum("nj,njk,nk -> n", dfds, Be, ue)
+            if psi.ndim == 1 and phi.ndim == 1:
+                se0 = np.einsum("nijl,nj,nl -> ni", Te, psie[:, ::2], phie[:, ::2])
+                se1 = np.einsum("nijl,nj,nl -> ni", Te, psie[:, 1::2], phie[:, 1::2])
+                se = se0 + se1
 
-        elif psi.ndim == 2 and phi.ndim == 2:
-            for j in range(2):
-                for i in range(2):
-                    xi = gauss_pts[i]
-                    eta = gauss_pts[j]
-                    detJ = populate_Be_and_Te(self.nelems, xi, eta, xe, ye, Be, Te)
+            elif psi.ndim == 2 and phi.ndim == 2:
+                se = np.einsum("nijl,njl -> ni", Te, self.pp)
 
-                    # Compute the derivative of the stress w.r.t. u
-                    se0 = np.einsum(
-                        "nijl,njk,nlk -> ni", Te, psie[:, ::2, ...], phie[:, ::2, ...]
-                    )
-                    se1 = np.einsum(
-                        "nijl,njk,nlk -> ni", Te, psie[:, 1::2, ...], phie[:, 1::2, ...]
-                    )
-                    se = se0 + se1
-                    dfds = np.einsum("n,ij,ni -> nj", detJ, self.C0, se)
-
-                    # Add contributions to the derivative w.r.t. C
-                    dfdrhoE += np.einsum("nj,njk,nk -> n", dfds, Be, ue)
+            dfds = detJ[:, np.newaxis] * se @ self.C0
+            dfdrhoE += np.einsum("nj,njk,nk -> n", dfds, Be, ue)
 
         if self.ptype_G == "simp":
             dfdrhoE[:] *= self.p * rhoE ** (self.p - 1)
@@ -466,30 +478,16 @@ class TopologyAnalysis:
             dfdrhoE[:] *= (2.0 + self.q) / (1.0 + (self.q + 1.0) * (1.0 - rhoE)) ** 2
 
         dfdrho = np.zeros(self.nnodes)
-
-        for i in range(4):
-            np.add.at(dfdrho, self.conn[:, i], dfdrhoE)
+        np.add.at(dfdrho, self.conn, dfdrhoE[:, np.newaxis])
         dfdrho *= 0.25
 
         return dfdrho
 
+    def eval_area(self):
+        return np.sum(self.detJ.reshape(-1) * np.tile(self.rhoE, 4))
+
     def eval_area_gradient(self):
-        dfdrhoE = np.zeros(self.nelems)
-
-        # Quadrature points
-        gauss_pts = [-1.0 / np.sqrt(3.0), 1.0 / np.sqrt(3.0)]
-
-        # Compute the x and y coordinates of each element
-        xe = self.X[self.conn, 0]
-        ye = self.X[self.conn, 1]
-
-        for j in range(2):
-            for i in range(2):
-                xi = gauss_pts[i]
-                eta = gauss_pts[j]
-                detJ = compute_detJ(self.nelems, xi, eta, xe, ye)
-
-                dfdrhoE[:] += detJ
+        dfdrhoE = np.sum(self.detJ, axis=1)
 
         dfdrho = np.zeros(self.nnodes)
         for i in range(4):
@@ -547,7 +545,7 @@ class TopologyAnalysis:
 
         return
 
-    def solve_eigenvalue_problem(self, rhoE):
+    def solve_eigenvalue_problem(self, rhoE, store=False):
         """
         Compute the smallest buckling load factor BLF
         """
@@ -568,7 +566,7 @@ class TopologyAnalysis:
         self.Gr = self.reduce_matrix(G)
 
         t1 = time.time()
-        self.profile["matrix assembly time"] = t1 - t0
+        self.profile["matrix assembly time"] += t1 - t0
 
         # Find the eigenvalues closest to zero. This uses a shift and
         # invert strategy around sigma = 0, which means that the largest
@@ -612,14 +610,17 @@ class TopologyAnalysis:
                         self.sigma,
                     )
 
-                self.profile["solve preconditioner count"] = (
-                    self.factor.count if i == 0 else None
+                    if store:
+                        self.profile["eig_res"] = self.eig_solver.eig_res.tolist()
+
+                self.profile["solve preconditioner count"] += (
+                    self.factor.count if i == 0 else 0
                 )
 
         t2 = time.time()
         t = (t2 - t1) / self.cost
 
-        self.profile["eigenvalue solve time"] = t
+        self.profile["eigenvalue solve time"] += t
         self.profile["m"] = self.m
         self.profile["eig_solver.m"] = str(self.eig_solver.m)
         self.BLF = mu[: self.N]
@@ -629,6 +630,74 @@ class TopologyAnalysis:
         Q[self.reduced, ...] = self.Qr[:, ...]
 
         return mu, Q
+
+    def compliance(self):
+        return self.f.dot(self.u)
+
+    def compliance_derivative(self):
+        dfdrho = -1.0 * self.get_stiffness_matrix_deriv(self.rhoE, self.u, self.u)
+        return self.fltr.apply_gradient(dfdrho, self.x)
+
+    def eval_ks_buckling(self, ks_rho=160.0):
+        mu = 1 / self.BLF
+        c = max(mu)
+        eta = np.exp(ks_rho * (mu - c))
+        ks_min = c + np.log(np.sum(eta)) / ks_rho
+        return ks_min
+
+    def eval_ks_buckling_derivative(self, ks_rho=160.0):
+        t0 = time.time()
+        mu = 1 / self.BLF
+        c = max(mu)
+        eta = np.exp(ks_rho * (mu - c))
+        eta = eta / np.sum(eta)
+
+        dfdrho = np.zeros(self.nnodes)
+        if self.deriv_type == "vector":
+            for i in range(self.N):
+                dKdx = self.get_stiffness_matrix_deriv(
+                    self.rhoE, self.Q[:, i], self.Q[:, i]
+                )
+                dGdx = self.get_stress_stiffness_matrix_xderiv(
+                    self.rhoE, self.u, self.Q[:, i], self.Q[:, i]
+                )
+
+                dGdu = self.get_stress_stiffness_matrix_uderiv(
+                    self.rhoE, self.Q[:, i], self.Q[:, i]
+                )
+                dGdur = self.reduce_vector(dGdu)
+                adjr = -self.Kfact(dGdur)
+                adj = self.full_vector(adjr)
+
+                dGdx += self.get_stiffness_matrix_deriv(self.rhoE, adj, self.u)
+
+                dfdrho -= eta[i] * (dGdx + mu[i] * dKdx)
+
+        elif self.deriv_type == "tensor":
+            eta_Q = (eta[:, np.newaxis] * self.Q.T).T
+            eta_mu_Q = (eta[:, np.newaxis] * mu[:, np.newaxis] * self.Q.T).T
+
+            dKdx = self.get_stiffness_matrix_deriv(self.rhoE, eta_mu_Q, self.Q)
+
+            dfds = self.intital_stress_stiffness_matrix_deriv(
+                self.rhoE, self.Te, self.detJ, eta_Q, self.Q
+            )
+            dGdu = self.get_stress_stiffness_matrix_uderiv_tensor(dfds, self.Be)
+            dGdur = self.reduce_vector(dGdu)
+            adjr = -self.Kfact(dGdur)
+            adj = self.full_vector(adjr)
+
+            dGdx = self.get_stress_stiffness_matrix_xderiv_tensor(
+                self.rhoE, self.u, dfds, self.Be
+            )
+            dGdx += self.get_stiffness_matrix_deriv(self.rhoE, adj, self.u)
+
+            dfdrho -= dGdx + dKdx
+
+        t1 = time.time()
+        self.profile["total derivative time"] += t1 - t0
+
+        return self.fltr.apply_gradient(dfdrho, self.x)
 
     def get_eigenvector_aggregate(self, rho, node, mode="tanh"):
         if mode == "exp":
@@ -648,7 +717,7 @@ class TopologyAnalysis:
 
         h = 0.0
         for i in range(self.N):
-            h += eta[i] * self.Q[node, i] ** 2
+            h += eta[i] * np.dot(self.Q[node, i], self.Q[node, i])
 
         return h
 
@@ -668,7 +737,7 @@ class TopologyAnalysis:
 
         h = 0.0
         for i in range(self.N):
-            h += eta[i] * self.Q[node, i] ** 2
+            h += eta[i] * np.dot(self.Q[node, i], self.Q[node, i])
 
         Qb = np.zeros(self.Q.shape)
         for i in range(self.N):
@@ -676,15 +745,87 @@ class TopologyAnalysis:
             self.Qrb[:, i] += Qb[self.reduced, i]
 
             if mode == "exp":
-                self.lamb[i] -= hb * rho * eta[i] * (self.Q[node, i] ** 2 - h)
+                self.lamb[i] -= (
+                    hb * rho * eta[i] * (np.dot(self.Q[node, i], self.Q[node, i]) - h)
+                )
             else:
                 self.lamb[i] -= (
-                    hb * rho * eta[i] * (a[i] + b[i]) * (self.Q[node, i] ** 2 - h)
+                    hb
+                    * rho
+                    * eta[i]
+                    * (a[i] + b[i])
+                    * (np.dot(self.Q[node, i], self.Q[node, i]) - h)
                 )
 
         return
 
-    def initialize(self):
+    def KSmax(self, q, ks_rho):
+        c = np.max(q)
+        eta = np.exp(ks_rho * (q - c))
+        ks_max = c + np.log(np.sum(eta)) / ks_rho
+        return ks_max
+
+    def eigenvector_aggregate_magnitude(self, rho, node):
+        # Tanh aggregate
+        lam_a = 0.0
+        lam_b = 1000.0
+        a = np.tanh(rho * (self.lam - lam_a))
+        b = np.tanh(rho * (self.lam - lam_b))
+        eta = a - b
+
+        # Normalize the weights
+        eta = eta / np.sum(eta)
+
+        h = 0.0
+        for i in range(self.N):
+            h += eta[i] * self.Q[node, i] ** 2
+
+        return h, eta, a, b
+
+    def get_eigenvector_aggregate_max(self, rho, node):
+        h, _, _, _ = self.eigenvector_aggregate_magnitude(rho, node)
+        h = self.KSmax(h, rho)
+        return h
+
+    def add_eigenvector_aggregate_max_derivative(self, hb, rho, node):
+        h_mag, eta, a, b = self.eigenvector_aggregate_magnitude(rho, node)
+
+        eta_h = np.exp(rho * (h_mag - np.max(h_mag)))
+        eta_h = eta_h / np.sum(eta_h)
+
+        h = np.dot(eta_h, h_mag)
+
+        def D(q):
+
+            nn = len(q)
+            eta_Dq = np.zeros(nn)
+
+            for i in range(nn):
+                eta_Dq[i] = eta_h[i] * q[i]
+            return eta_Dq
+
+        Qb = np.zeros(self.Q.shape)
+        for i in range(self.N):
+            Qb[node, i] += 2.0 * hb * eta[i] * D(self.Q[node, i])
+            self.Qrb[:, i] += Qb[self.reduced, i]
+            self.lamb[i] -= (
+                hb
+                * rho
+                * eta[i]
+                * (a[i] + b[i])
+                * (self.Q[node, i].T @ D(self.Q[node, i]) - h)
+            )
+
+        return
+
+    def initialize(self, store=False):
+        self.profile["total derivative time"] = 0.0
+        self.profile["adjoint solution time"] = 0.0
+        self.profile["matrix assembly time"] = 0.0
+        self.profile["eigenvalue solve time"] = 0.0
+        self.profile["solve preconditioner count"] = 0
+        self.profile["adjoint preconditioner count"] = 0
+
         # Apply the filter
         self.rho = self.fltr.apply(self.x)
 
@@ -696,9 +837,13 @@ class TopologyAnalysis:
             + self.rho[self.conn[:, 3]]
         )
 
+        self.Be, self.Te, self.detJ = self.intital_Be_and_Te()
+
         # Solve the eigenvalue problem
-        self.lam, self.Q = self.solve_eigenvalue_problem(self.rhoE)
-        self.profile["BLF"] = self.BLF.tolist()
+        self.lam, self.Q = self.solve_eigenvalue_problem(self.rhoE, store)
+
+        if store:
+            self.profile["eigenvalues"] = self.BLF.tolist()
 
         return
 
@@ -756,15 +901,26 @@ class TopologyAnalysis:
 
         self.psir = psir
 
-        self.profile["adjoint preconditioner count"] = self.factor.count
-        self.profile["adjoint solution time"] = t
+        self.profile["adjoint preconditioner count"] += self.factor.count
+        self.profile["adjoint solution time"] += t
         self.profile["adjoint residuals"] = np.array(callback.res_list).tolist()
+        self.profile["adjoint iterations"] = len(callback.res_list)
         self.profile["adjoint correction data"] = corr_data
 
         def dAdu(wr, vr):
             w = self.full_vector(wr)
             v = self.full_vector(vr)
-            return self.get_stress_stiffness_matrix_uderiv(self.rhoE, w, v)
+            if w.ndim == 1 and v.ndim == 1:
+                return self.get_stress_stiffness_matrix_uderiv(self.rhoE, w, v)
+
+            elif w.ndim == 2 and v.ndim == 2:
+                if self.dfds is None:
+                    self.dfds = self.intital_stress_stiffness_matrix_deriv(
+                        self.rhoE, self.Te, self.detJ, w, v
+                    )
+                return self.get_stress_stiffness_matrix_uderiv_tensor(
+                    self.dfds, self.Be
+                )
 
         dBdu = None
 
@@ -786,7 +942,18 @@ class TopologyAnalysis:
         def dAdx(wr, vr):
             w = self.full_vector(wr)
             v = self.full_vector(vr)
-            return self.get_stress_stiffness_matrix_xderiv(self.rhoE, self.u, w, v)
+
+            if w.ndim == 1 and v.ndim == 1:
+                return self.get_stress_stiffness_matrix_xderiv(self.rhoE, self.u, w, v)
+
+            elif w.ndim == 2 and v.ndim == 2:
+                if self.dfds is None:
+                    self.dfds = self.intital_stress_stiffness_matrix_deriv(
+                        self.rhoE, self.Te, self.detJ, w, v
+                    )
+                return self.get_stress_stiffness_matrix_xderiv_tensor(
+                    self.rhoE, self.u, self.dfds, self.Be
+                )
 
         def dBdx(wr, vr):
             w = self.full_vector(wr)
@@ -814,21 +981,20 @@ class TopologyAnalysis:
         self.xb += self.fltr.apply_gradient(self.rhob, self.x)
 
         t2 = time.time()
-        self.profile["total derivative time"] = t2 - t1
+        self.profile["total derivative time"] += t2 - t1
 
         return
 
     def test_eigenvector_aggregate_derivatives(
-        self, rho=100, dh_cd=1e-4, dh_cs=1e-20, pert=None, mode="exp"
+        self, rho=100, dh_cd=1e-4, dh_cs=1e-20, node=None, pert=None, mode="tanh"
     ):
 
         hb = 1.0
-        node = (8 + 1) * 16 + 16
-        mode = "tanh"
+        if node is None:
+            node = (8 + 1) * 16 + 16
 
         # Initialize the problem
-        self.initialize()
-        # h1 = self.get_eigenvector_aggregate(rho, node)
+        self.initialize(store=True)
 
         # Copy the design variables
         x0 = np.array(self.x)
@@ -888,6 +1054,112 @@ class TopologyAnalysis:
 
         return data
 
+    def test_ks_buckling_derivatives(self, dh_fd=1e-4, ks_rho=30, pert=None):
+        # Initialize the problem
+        self.initialize(store=True)
+
+        # Copy the design variables
+        x0 = np.array(self.x)
+
+        # compute the compliance derivative
+        t0 = time.time()
+        dks = self.eval_ks_buckling_derivative(ks_rho)
+        t1 = time.time()
+
+        pert = np.random.uniform(size=x0.shape)
+
+        ans = np.dot(pert, dks)
+
+        self.x = x0 + dh_fd * pert
+        self.initialize()
+        c1 = self.eval_ks_buckling(ks_rho)
+
+        self.x = x0 - dh_fd * pert
+        self.initialize()
+        c2 = self.eval_ks_buckling(ks_rho)
+
+        cd = (c1 - c2) / (2 * dh_fd)
+
+        print("\nTotal derivative for ks-buckling:", self.deriv_type + " type")
+        print("Ans:                 ", ans)
+        print("CD:                  ", cd)
+        print("Rel err:             ", (ans - cd) / cd)
+        print("Time for derivative: ", t1 - t0, "s")
+
+        return
+
+    def test_compliance_derivatives(self, dh_fd=1e-4, pert=None):
+        # Initialize the problem
+        self.initialize(store=True)
+
+        # Copy the design variables
+        x0 = np.array(self.x)
+
+        # compute the compliance derivative
+        dks = self.compliance_derivative()
+
+        pert = np.random.uniform(size=x0.shape)
+
+        ans = np.dot(pert, dks)
+
+        self.x = x0 + dh_fd * pert
+        self.initialize()
+        c1 = self.compliance()
+
+        self.x = x0 - dh_fd * pert
+        self.initialize()
+        c2 = self.compliance()
+
+        cd = (c1 - c2) / (2 * dh_fd)
+
+        print("\nTotal derivative for true compliance")
+        print("Ans:                 ", ans)
+        print("CD:                  ", cd)
+        print("Rel err:             ", (ans - cd) / cd)
+
+        return
+
+    def test_eigenvector_aggregate_max_derivatives(
+        self, dh_fd=1e-4, rho_agg=100, pert=None, node=None
+    ):
+
+        hb = 1.0
+        if node is None:
+            node = []
+            for i in range(self.nnodes):
+                node.append(i)
+
+        # Initialize the problem
+        self.initialize(store=True)
+
+        # Copy the design variables
+        x0 = np.array(self.x)
+
+        # compute the compliance derivative
+        self.initialize_adjoint()
+        self.add_eigenvector_aggregate_max_derivative(hb, rho_agg, node)
+        self.finalize_adjoint()
+
+        pert = np.random.uniform(size=x0.shape)
+
+        ans = np.dot(pert, self.xb)
+
+        self.x = x0 + dh_fd * pert
+        self.initialize()
+        h1 = self.get_eigenvector_aggregate_max(rho_agg, node)
+
+        self.x = x0 - dh_fd * pert
+        self.initialize()
+        h2 = self.get_eigenvector_aggregate_max(rho_agg, node)
+        cd = (h1 - h2) / (2 * dh_fd)
+
+        print("\nTotal derivative for aggregate-max")
+        print("Ans = ", ans)
+        print("CD  = ", cd)
+        print("Rel err = ", (ans - cd) / cd, "\n")
+
+        return
+
     def get_pts_and_tris(self, eta=None):
         pts = np.zeros((self.nnodes, 3))
 
@@ -943,14 +1215,27 @@ class TopologyAnalysis:
 
         return
 
-    def plot_design(self, path=None):
+    def plot_design(self, path=None, index=None):
         fig, ax = plt.subplots()
         self.plot(self.rho, ax=ax)
         ax.set_aspect("equal")
         ax.axis("off")
 
+        # plot the bcs
+        for i, v in self.bcs.items():
+            ax.scatter(self.X[i, 0], self.X[i, 1], color="k")
+
+        for i, v in self.forces.items():
+            ax.quiver(self.X[i, 0], self.X[i, 1], v[0], v[1], color="r", scale=1e-3)
+
+        if index is not None:
+            for i in index:
+                ax.scatter(
+                    self.X[i, 0], self.X[i, 1], color="orange", s=5, clip_on=False
+                )
+
         if path is not None:
-            fig.savefig(path, bbox_inches="tight", dpi=300)
+            fig.savefig(path, bbox_inches="tight", dpi=150)
 
         plt.close(fig)
 
@@ -1077,8 +1362,9 @@ def domain_compressed_column(nx=64, ny=128, Lx=1.0, Ly=2.0, shear_force=False):
         # apply a vertical force at the top middle
         offset = int(np.ceil(nx / 30))
         for i in range(offset):
-            forces[nodes[nx // 2 - i, ny]] = [0, -P / (2 * offset)]
-            forces[nodes[nx // 2 + 1 + i, ny]] = [0, -P / (2 * offset)]
+            forces[nodes[nx // 2 - i - 1, ny]] = [0, -P / (2 * offset + 1)]
+            forces[nodes[nx // 2 + i + 1, ny]] = [0, -P / (2 * offset + 1)]
+        forces[nodes[nx // 2, ny]] = [0, -P / (2 * offset + 1)]
 
     return conn, X, dvmap, num_design_vars, bcs, forces
 
@@ -1128,10 +1414,16 @@ if __name__ == "__main__":
 
     import sys
 
-    solver_type = "IRAM"
+    solver_type = "BasicLanczos"
+    if "IRAM" in sys.argv:
+        solver_type = "IRAM"
+
+    sigma = 3.0
+
     if "dl" in sys.argv:
         solver_type = "BasicLanczos"
         method = "dl"
+        sigma = 6.0
         adjoint_options = {"lanczos_guess": False}
     elif "pcpg" in sys.argv:
         method = "pcpg"
@@ -1150,10 +1442,6 @@ if __name__ == "__main__":
             "bs_target": 1,
         }
 
-    solver_type = "BasicLanczos"
-    if "IRAM" in sys.argv:
-        solver_type = "IRAM"
-
     print("method = ", method)
     print("adjoint_options = ", adjoint_options)
     print("solver_type = ", solver_type)
@@ -1162,7 +1450,7 @@ if __name__ == "__main__":
         nx=64,
         rfact=4.0,
         N=10,
-        sigma=3.0,
+        sigma=sigma,
         solver_type=solver_type,
         adjoint_method=method,
         adjoint_options=adjoint_options,
@@ -1171,7 +1459,7 @@ if __name__ == "__main__":
     )
 
     # Check the eigenvector aggregate derivatives
-    data = topo.test_eigenvector_aggregate_derivatives(mode="tanh", rho=1000.0)
+    data = topo.test_eigenvector_aggregate_derivatives(mode="tanh", rho=100.0)
 
     if "adjoint residuals" in data and len(data["adjoint residuals"]) > 0:
         fig, ax = plt.subplots(figsize=(8, 5))
